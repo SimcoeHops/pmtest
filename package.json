@@ -1,0 +1,13 @@
+{
+  "name": "helm",
+  "version": "1.0.0",
+  "description": "Helm — a beautiful, ADHD-friendly project & task manager for IT managers. Zero dependencies.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
