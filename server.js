@@ -517,11 +517,44 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// ---------------------------------------------------------------- optional HTTP Basic Auth
+// Set HELM_PASSWORD env var to protect the whole app with a password.
+// Username can be anything (or set HELM_USER; defaults to "helm").
+// When not set the app is open — fine for local LAN, not for the internet.
+
+const HELM_PASSWORD = process.env.HELM_PASSWORD || '';
+const HELM_USER = process.env.HELM_USER || 'helm';
+
+function checkAuth(req, res) {
+  if (!HELM_PASSWORD) return true; // no password configured → open
+  const header = req.headers['authorization'] || '';
+  if (header.startsWith('Basic ')) {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const colon = decoded.indexOf(':');
+    if (colon > -1) {
+      const user = decoded.slice(0, colon);
+      const pass = decoded.slice(colon + 1);
+      // Constant-time comparison to prevent timing attacks.
+      const ua = Buffer.from(user.padEnd(64)), ub = Buffer.from(HELM_USER.padEnd(64));
+      const pa = Buffer.from(pass.padEnd(64)), pb = Buffer.from(HELM_PASSWORD.padEnd(64));
+      const ok = crypto.timingSafeEqual(ua, ub) && crypto.timingSafeEqual(pa, pb);
+      if (ok) return true;
+    }
+  }
+  res.writeHead(401, {
+    'WWW-Authenticate': 'Basic realm="Helm", charset="UTF-8"',
+    'Content-Type': 'text/plain',
+  });
+  res.end('Authentication required');
+  return false;
+}
+
 // ---------------------------------------------------------------- server
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
+  if (!checkAuth(req, res)) return;
   try {
     if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname);
     return serveStatic(req, res, pathname);
@@ -553,6 +586,11 @@ const server = http.createServer(async (req, res) => {
     console.log(`    Local:    http://localhost:${PORT}`);
     lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
     console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync)' : ''}`);
+    if (HELM_PASSWORD) {
+      console.log(`    Auth:     password protected (user: ${HELM_USER})`);
+    } else {
+      console.log('    Auth:     ⚠ no password — set HELM_PASSWORD env var before exposing to the internet');
+    }
     console.log('');
   });
 })();

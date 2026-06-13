@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: helm
+    runtime: node
+    plan: free
+    buildCommand: echo "No build step needed"
+    startCommand: node server.js
+    healthCheckPath: /api/state
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HELM_PASSWORD
+        generateValue: false  # Set this manually in Render dashboard
+      - key: DATABASE_URL
+        generateValue: false  # Optional: Neon Postgres URL for cloud sync
