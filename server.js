@@ -65,19 +65,26 @@ if (useNeon) {
 }
 
 async function neonQuery(query, params = []) {
-  const resp = await fetch(neonEndpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Neon-Connection-String': NEON_URL,
-      'Neon-Raw-Text-Output': 'true',
-      'Neon-Array-Mode': 'false',
-    },
-    body: JSON.stringify({ query, params }),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
-  return data; // { rows: [...] }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000); // 10s max — prevents startup hang
+  try {
+    const resp = await fetch(neonEndpoint, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Neon-Connection-String': NEON_URL,
+        'Neon-Raw-Text-Output': 'true',
+        'Neon-Array-Mode': 'false',
+      },
+      body: JSON.stringify({ query, params }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
+    return data; // { rows: [...] }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 let lastNeonLoad = 0;
@@ -570,32 +577,41 @@ const server = http.createServer(async (req, res) => {
 
 (async function start() {
   loadDataLocal();
+
+  // Listen FIRST so the healthcheck passes immediately, then connect to Neon.
+  // Previously neonLoad() ran before listen() — if Neon was slow the server
+  // never bound to the port and Railway's healthcheck timed out.
+  await new Promise((resolve) => {
+    server.listen(PORT, HOST, () => {
+      const nets = os.networkInterfaces();
+      const lan = [];
+      for (const name of Object.keys(nets)) {
+        for (const ni of nets[name] || []) {
+          if (ni.family === 'IPv4' && !ni.internal) lan.push(ni.address);
+        }
+      }
+      console.log('');
+      console.log('  ⎈ Helm is running');
+      console.log(`    Local:    http://localhost:${PORT}`);
+      lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
+      console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync — connecting…)' : ''}`);
+      if (HELM_PASSWORD) {
+        console.log(`    Auth:     password protected (user: ${HELM_USER})`);
+      } else {
+        console.log('    Auth:     ⚠ no password — set HELM_PASSWORD env var before exposing to the internet');
+      }
+      console.log('');
+      resolve();
+    });
+  });
+
+  // Now connect to Neon in the background — won't block startup or healthcheck.
   if (useNeon) {
     try {
       await neonLoad();
       console.log('  ☁ Cloud sync: connected to Neon Postgres');
     } catch (err) {
-      console.error('  ☁ Cloud sync FAILED, falling back to local file:', err.message);
+      console.error('  ☁ Cloud sync FAILED (serving local data):', err.message);
     }
   }
-  server.listen(PORT, HOST, () => {
-    const nets = os.networkInterfaces();
-    const lan = [];
-    for (const name of Object.keys(nets)) {
-      for (const ni of nets[name] || []) {
-        if (ni.family === 'IPv4' && !ni.internal) lan.push(ni.address);
-      }
-    }
-    console.log('');
-    console.log('  ⎈ Helm is running');
-    console.log(`    Local:    http://localhost:${PORT}`);
-    lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
-    console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync)' : ''}`);
-    if (HELM_PASSWORD) {
-      console.log(`    Auth:     password protected (user: ${HELM_USER})`);
-    } else {
-      console.log('    Auth:     ⚠ no password — set HELM_PASSWORD env var before exposing to the internet');
-    }
-    console.log('');
-  });
 })();
