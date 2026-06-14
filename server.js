@@ -296,6 +296,11 @@ async function handleAPI(req, res, pathname) {
   const seg = pathname.split('/').filter(Boolean); // ['api', 'tasks', ':id', ...]
   const method = req.method;
 
+  // GET /api/health — instant liveness check for Railway/Render
+  if (pathname === '/api/health' && method === 'GET') {
+    return sendJSON(res, 200, { ok: true });
+  }
+
   // GET /api/state — everything the client needs
   if (pathname === '/api/state' && method === 'GET') {
     await maybeRefreshFromNeon();
