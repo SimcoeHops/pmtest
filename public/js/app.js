@@ -624,7 +624,16 @@ function workloadContext({ projectId = null, includeDone = true } = {}) {
 
 // ------------------------------------------------------------ views
 
-function setView(html) { $('#view').innerHTML = html; }
+function setView(html) {
+  const v = $('#view');
+  v.innerHTML = html;
+  // Re-trigger the CSS entry animation on each view change.
+  v.style.animation = 'none';
+  v.offsetHeight; // force reflow
+  v.style.animation = '';
+  // Scroll back to top on every navigation.
+  v.scrollTo ? v.scrollTo(0, 0) : (v.scrollTop = 0);
+}
 
 function navHighlight() {
   $$('#nav a, #mobilenav a').forEach((a) => {
