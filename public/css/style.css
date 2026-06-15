@@ -49,9 +49,6 @@
 html {
   -webkit-text-size-adjust: 100%;
   overscroll-behavior: none;
-  /* -webkit-fill-available fills the true WKWebView frame on iOS PWA (full screen
-     including safe-area zones), unlike 100vh/100dvh which use the visual viewport */
-  height: -webkit-fill-available;
   height: 100%;
 }
 body {
@@ -62,8 +59,6 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
-  min-height: 100vh;
-  min-height: -webkit-fill-available;
   height: 100%;
   overflow: hidden;
 }
@@ -84,6 +79,18 @@ button, a, nav, .brand, .chip, .stat .lbl, .stat .num,
 #mobilenav, #topbar, .page-head h1, .section-title {
   -webkit-user-select: none;
   user-select: none;
+}
+
+/* ---- iOS PWA: fill the true WKWebView frame, not just the visual viewport ---
+   100vh/100dvh on iOS resolves to the visual-viewport height which excludes the
+   status-bar area. In standalone PWA mode the WKWebView covers the FULL screen,
+   so we must use -webkit-fill-available (comes AFTER height:100% in the
+   @supports block so it wins the cascade on WebKit/iOS). The feature test
+   -webkit-touch-callout:none targets iOS Safari exclusively. */
+@supports (-webkit-touch-callout: none) {
+  html   { height: -webkit-fill-available; }
+  body   { height: -webkit-fill-available; }
+  #layout { min-height: -webkit-fill-available; }
 }
 
 /* ---- iOS standalone: push content below the status bar ------------ */
