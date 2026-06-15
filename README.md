@@ -1,6 +1,6 @@
 # ⎈ Helm
 
-A beautiful, fast, ADHD-friendly project & task manager you run yourself.
+A beautiful, fast project & task manager you run yourself.
 **Zero dependencies** — if you have Node.js, you have Helm.
 
 Built for an IT manager juggling many things: gorgeous dashboard, instant
