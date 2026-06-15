@@ -49,6 +49,9 @@
 html {
   -webkit-text-size-adjust: 100%;
   overscroll-behavior: none;
+  /* -webkit-fill-available fills the true WKWebView frame on iOS PWA (full screen
+     including safe-area zones), unlike 100vh/100dvh which use the visual viewport */
+  height: -webkit-fill-available;
   height: 100%;
 }
 body {
@@ -59,8 +62,9 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
+  min-height: 100vh;
+  min-height: -webkit-fill-available;
   height: 100%;
-  /* Prevent pull-to-refresh interfering with the app */
   overflow: hidden;
 }
 /* The actual scrollable area */
@@ -111,7 +115,7 @@ kbd {
 
 /* ------------------------------------------------------------ layout */
 
-#layout { display: flex; height: 100dvh; overflow: hidden; }
+#layout { display: flex; height: 100%; overflow: hidden; }
 
 #sidebar {
   width: var(--sidebar-w);
@@ -122,7 +126,7 @@ kbd {
   flex-direction: column;
   position: sticky;
   top: 0;
-  height: 100vh;
+  height: 100%;
   padding: 18px 14px;
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; }
@@ -711,7 +715,7 @@ kbd {
     transform: translateX(-105%);
     transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
     box-shadow: var(--shadow);
-    height: 100dvh;
+    height: 100%;
   }
   #sidebar.open { transform: translateX(0); }
   #btn-menu { display: grid; }
