@@ -822,6 +822,105 @@ kbd {
   animation: fadein 0.2s;
 }
 
+/* ------------------------------------------------------------ login screen */
+
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 24px 16px env(safe-area-inset-bottom, 24px);
+}
+.login-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 44px 32px 36px;
+  width: 100%;
+  max-width: 380px;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+  animation: view-enter 0.3s ease;
+}
+.login-mark {
+  font-size: 52px;
+  line-height: 1;
+  margin-bottom: 10px;
+}
+.login-title {
+  font-size: 26px;
+  font-weight: 700;
+  margin: 0 0 4px;
+  background: var(--grad);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.login-sub {
+  color: var(--text-faint);
+  margin: 0 0 28px;
+  font-size: 14px;
+}
+.btn-google {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  width: 100%;
+  box-sizing: border-box;
+}
+.btn-google:hover { border-color: var(--accent); background: var(--card-2); }
+.login-divider {
+  color: var(--text-faint);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 18px 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.login-divider::before, .login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+#login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.login-input {
+  width: 100%;
+  padding: 13px 15px;
+  font-size: 16px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+  -webkit-appearance: none;
+}
+.login-input:focus { outline: none; border-color: var(--accent); }
+.login-err {
+  color: var(--red);
+  font-size: 13px;
+  margin: 6px 0 0;
+  text-align: center;
+}
+
 /* ------------------------------------------------------------ print (boss report) */
 
 @media print {
