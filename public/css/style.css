@@ -98,8 +98,8 @@ button, a, nav, .brand, .chip, .stat .lbl, .stat .num,
    env(safe-area-inset-top) gives us the exact height to compensate. */
 @supports (padding-top: env(safe-area-inset-top)) {
   #topbar {
-    padding-top: calc(10px + env(safe-area-inset-top));
-    height: calc(56px + env(safe-area-inset-top));
+    padding-top: calc(14px + env(safe-area-inset-top));
+    height: calc(60px + env(safe-area-inset-top));
   }
   #sidebar {
     padding-top: calc(18px + env(safe-area-inset-top));
