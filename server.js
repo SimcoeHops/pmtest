@@ -566,6 +566,10 @@ function checkAuth(req, res) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
+  // Health endpoint must bypass auth — Railway's healthcheck has no credentials.
+  if (pathname === '/api/health' && req.method === 'GET') {
+    return sendJSON(res, 200, { ok: true });
+  }
   if (!checkAuth(req, res)) return;
   try {
     if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname);
