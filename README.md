@@ -1,3 +1,4 @@
+# ⎈ Helm
 
 A beautiful, fast, ADHD-friendly project & task manager you run yourself.
 **Zero dependencies** — if you have Node.js, you have Helm.
@@ -52,6 +53,14 @@ The token only allows creating tasks, never reading your data.
 - **Windows:** create a shortcut to `node server.js` in `shell:startup`, or use Task Scheduler.
 
 ---
+
+## ☁ Deploy to the cloud (Railway / Render)
+
+Helm ships with `railway.json`, `render.yaml`, and a `Procfile` so it deploys as
+a Node service out of the box. Both platforms health-check `GET /api/health`
+(which bypasses auth, so the probe passes even with a password set). Set the env
+vars from the table below — at minimum `HELM_PASSWORD` (and/or Google) for a
+public instance, plus `DATABASE_URL` for cloud sync.
 
 ## ☁ Optional cloud sync (Neon Postgres)
 
