@@ -12,34 +12,13 @@ const crypto = require('crypto');
 const { parseCapture } = require('./public/js/capture.js'); // shared with the browser
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4321;
+// A standalone token that authorizes ONLY quick-capture (creating tasks), for
+// iOS Shortcuts / automations that can't carry a login session.
+const CAPTURE_TOKEN = process.env.HELM_CAPTURE_TOKEN || '';
 const HOST = process.env.HOST || '0.0.0.0';
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'helm.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
-
-// ---------------------------------------------------------------- auth config
-/* Auth is enabled when a password and/or Google OAuth is configured via env.
- * With neither set, the server runs OPEN (handy for localhost). Sessions are
- * stateless signed cookies (HMAC) — zero-dependency, survive restarts as long
- * as SESSION_SECRET is stable. */
-const HELM_PASSWORD = process.env.HELM_PASSWORD || '';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || '';
-const ALLOWED_EMAILS = (process.env.HELM_ALLOWED_EMAILS || '')
-  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-const hasPassword = !!HELM_PASSWORD;
-const hasGoogle = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
-const authEnabled = hasPassword || hasGoogle;
-const SESSION_SECRET = process.env.SESSION_SECRET
-  || (authEnabled
-    ? crypto.createHash('sha256').update('helm:' + HELM_PASSWORD + ':' + GOOGLE_CLIENT_SECRET).digest('hex')
-    : crypto.randomBytes(32).toString('hex'));
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const COOKIE = 'helm_session';
-// A standalone token that authorizes ONLY quick-capture (creating tasks), for
-// iOS Shortcuts / automations that can't carry a login session.
-const CAPTURE_TOKEN = process.env.HELM_CAPTURE_TOKEN || '';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -69,7 +48,7 @@ function defaultData() {
       openrouterModel: 'anthropic/claude-sonnet-4.5',
       weekStart: 'monday',
       lastRollover: '', // date (YYYY-MM-DD) My Day was last rolled over
-      tz: '', // IANA timezone (e.g. America/New_York) reported by the client
+      tz: '', // IANA timezone reported by the client (for server-fired reminders)
     },
   };
 }
@@ -81,11 +60,8 @@ let db = defaultData();
  * and the whole document is stored in Postgres via Neon's HTTP SQL endpoint
  * (no driver needed). The local JSON file is still written as a backup.
  * Run the server on any number of machines pointed at the same DATABASE_URL
- * and they share data. Saves are NOT blind last-writer-wins: before each write
- * we re-read the cloud copy and, if another device wrote since we last synced,
- * merge entity-by-entity (newer `updatedAt` wins per task/project) so a second
- * device's edits aren't clobbered. (Known limit: a delete on one device can be
- * resurrected by another device that still holds an older copy — no tombstones.)
+ * and they share data (last-writer-wins; state is re-pulled every few
+ * seconds of idle, so switching devices Just Works for a single user).
  */
 const NEON_URL = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || '';
 const useNeon = /^postgres(ql)?:\/\//.test(NEON_URL);
@@ -96,19 +72,26 @@ if (useNeon) {
 }
 
 async function neonQuery(query, params = []) {
-  const resp = await fetch(neonEndpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Neon-Connection-String': NEON_URL,
-      'Neon-Raw-Text-Output': 'true',
-      'Neon-Array-Mode': 'false',
-    },
-    body: JSON.stringify({ query, params }),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
-  return data; // { rows: [...] }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000); // 10s max — prevents startup hang
+  try {
+    const resp = await fetch(neonEndpoint, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Neon-Connection-String': NEON_URL,
+        'Neon-Raw-Text-Output': 'true',
+        'Neon-Array-Mode': 'false',
+      },
+      body: JSON.stringify({ query, params }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
+    return data; // { rows: [...] }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 let lastNeonLoad = 0;
@@ -294,122 +277,6 @@ function readBody(req) {
 const str = (v, fallback = '') => (typeof v === 'string' ? v : fallback);
 const arr = (v) => (Array.isArray(v) ? v : []);
 
-// ---------------------------------------------------------------- auth helpers
-
-const b64url = (s) => Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-const b64urlDecode = (s) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-const sign = (data) => crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64')
-  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-function makeSession(sub) {
-  const payload = b64url(JSON.stringify({ sub, exp: Date.now() + SESSION_TTL_MS }));
-  return payload + '.' + sign(payload);
-}
-function verifySession(token) {
-  if (!token || token.indexOf('.') < 0) return null;
-  const [payload, sig] = token.split('.');
-  const expected = sign(payload);
-  if (!sig || sig.length !== expected.length) return null;
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  try {
-    const data = JSON.parse(b64urlDecode(payload));
-    if (!data.exp || data.exp < Date.now()) return null;
-    return data;
-  } catch (_) { return null; }
-}
-function parseCookies(req) {
-  const out = {};
-  const h = req.headers.cookie;
-  if (!h) return out;
-  for (const part of h.split(';')) {
-    const i = part.indexOf('=');
-    if (i < 0) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
-const isSecureReq = (req) => (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
-function cookieHeader(name, value, maxAgeSec, req) {
-  const bits = [`${name}=${value}`, 'HttpOnly', 'Path=/', `Max-Age=${maxAgeSec}`, 'SameSite=Lax'];
-  if (isSecureReq(req)) bits.push('Secure');
-  return bits.join('; ');
-}
-const setSessionCookie = (req, res, token) =>
-  res.setHeader('Set-Cookie', cookieHeader(COOKIE, token, Math.floor(SESSION_TTL_MS / 1000), req));
-const clearSessionCookie = (req, res) =>
-  res.setHeader('Set-Cookie', cookieHeader(COOKIE, '', 0, req));
-const isAuthed = (req) => !authEnabled || !!verifySession(parseCookies(req)[COOKIE]);
-const hasCaptureToken = (req) => !!CAPTURE_TOKEN && req.headers['x-helm-token'] === CAPTURE_TOKEN;
-
-// ---- login rate limiting (per IP)
-const MAX_ATTEMPTS = 5;
-const LOCK_MS = 15 * 60 * 1000;
-const attempts = new Map(); // ip -> { count, first }
-function clientIP(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) return xff.split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
-}
-function rateState(ip) {
-  const rec = attempts.get(ip);
-  if (rec && Date.now() - rec.first > LOCK_MS) { attempts.delete(ip); return null; }
-  return rec || null;
-}
-
-// ---- Google OAuth (zero-dep, via fetch)
-function googleRedirectUri(req) {
-  if (GOOGLE_REDIRECT_URI) return GOOGLE_REDIRECT_URI;
-  const proto = isSecureReq(req) ? 'https' : 'http';
-  return `${proto}://${req.headers.host || `localhost:${PORT}`}/api/auth/google`;
-}
-function handleGoogleStart(req, res) {
-  if (!hasGoogle) { res.writeHead(404); return res.end('Google sign-in not configured'); }
-  const state = crypto.randomBytes(16).toString('hex');
-  res.setHeader('Set-Cookie', cookieHeader('helm_oauth_state', state, 600, req));
-  const params = new URLSearchParams({
-    client_id: GOOGLE_CLIENT_ID,
-    redirect_uri: googleRedirectUri(req),
-    response_type: 'code',
-    scope: 'openid email',
-    state,
-    prompt: 'select_account',
-  });
-  res.writeHead(302, { Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}` });
-  res.end();
-}
-async function handleGoogleCallback(req, res, url) {
-  const fail = (e) => { res.writeHead(302, { Location: '/?error=' + e }); res.end(); };
-  if (!hasGoogle) return fail('auth_failed');
-  const code = url.searchParams.get('code');
-  const state = url.searchParams.get('state');
-  const cookieState = parseCookies(req).helm_oauth_state;
-  if (!code || !state || !cookieState || state !== cookieState) return fail('auth_failed');
-  try {
-    const tok = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: googleRedirectUri(req),
-        grant_type: 'authorization_code',
-      }),
-    });
-    const data = await tok.json();
-    if (!tok.ok || !data.id_token) return fail('auth_failed');
-    const claims = JSON.parse(b64urlDecode(data.id_token.split('.')[1]));
-    const email = str(claims.email).toLowerCase();
-    if (!email || claims.email_verified === false) return fail('auth_failed');
-    if (ALLOWED_EMAILS.length && !ALLOWED_EMAILS.includes(email)) return fail('not_allowed');
-    setSessionCookie(req, res, makeSession('google:' + email));
-    res.writeHead(302, { Location: '/' });
-    res.end();
-  } catch (e) {
-    return fail('auth_failed');
-  }
-}
-
 // ---------------------------------------------------------------- entities
 
 function sanitizeProject(input, existing) {
@@ -484,26 +351,6 @@ function sanitizeTask(input, existing) {
   return t;
 }
 
-function localDateStr() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-// My Day daily rollover: on a new day, unfinished items carry over (stay on My
-// Day) while items completed on a previous day drop off, so the list stays
-// trustworthy instead of accreting yesterday's checked-off tasks. Returns true
-// if anything changed. (Uses server-local date; fine for a single user.)
-function maybeRolloverMyDay() {
-  const today = localDateStr();
-  if (db.settings.lastRollover === today) return false;
-  for (const t of db.tasks) {
-    if (t.today && t.status === 'done') t.today = false;
-  }
-  db.settings.lastRollover = today;
-  return true;
-}
-
 function nextDue(due, repeat) {
   const d = due ? new Date(due + 'T12:00:00') : new Date();
   switch (repeat) {
@@ -517,12 +364,30 @@ function nextDue(due, repeat) {
   return d.toISOString().slice(0, 10);
 }
 
+// ---------------------------------------------------------------- My Day rollover
+
+function localDateStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// On a new day, unfinished My Day items carry over while ones completed on a
+// previous day drop off. Returns true if anything changed.
+function maybeRolloverMyDay() {
+  const today = localDateStr();
+  if (db.settings.lastRollover === today) return false;
+  for (const t of db.tasks) {
+    if (t.today && t.status === 'done') t.today = false;
+  }
+  db.settings.lastRollover = today;
+  return true;
+}
+
 // ---------------------------------------------------------------- push notifications
-/* Server-side reminder firing via the Expo Push API, so a task's ⏰ reminder
- * pings the phone even when the app is closed. Reminders are stored as local
- * wall-clock ("YYYY-MM-DDTHH:MM") with no offset, so we evaluate "now" in the
- * client-reported timezone (settings.tz). On-device local notifications in the
- * mobile app are the no-server fallback; this is the always-on path. */
+// Server-side reminder firing via the Expo Push API, so a task's ⏰ reminder pings
+// the phone even when the app is closed. Reminders are local wall-clock with no
+// offset, so we evaluate "now" in the client-reported timezone (settings.tz).
 
 function localNowInTz(tz) {
   try {
@@ -535,7 +400,7 @@ function localNowInTz(tz) {
     let hh = g('hour'); if (hh === '24') hh = '00';
     return `${g('year')}-${g('month')}-${g('day')}T${hh}:${g('minute')}`;
   } catch (_) {
-    return new Date().toISOString().slice(0, 16); // UTC fallback
+    return new Date().toISOString().slice(0, 16);
   }
 }
 
@@ -568,65 +433,22 @@ async function fireDueReminders() {
   saveData();
 }
 
+const hasCaptureToken = (req) => !!CAPTURE_TOKEN && req.headers['x-helm-token'] === CAPTURE_TOKEN;
+const hasSession = (req) => {
+  const cookies = parseCookies(req.headers['cookie']);
+  return !!(cookies.helm_session && sessions.has(cookies.helm_session));
+};
+
 // ---------------------------------------------------------------- API router
 
-async function handleAPI(req, res, pathname, url) {
+async function handleAPI(req, res, pathname) {
   const seg = pathname.split('/').filter(Boolean); // ['api', 'tasks', ':id', ...]
   const method = req.method;
 
-  // ---- public auth endpoints (no session required)
-  if (pathname === '/api/auth-info' && method === 'GET') {
-    return sendJSON(res, 200, { hasPassword, hasGoogle });
-  }
-  if (pathname === '/api/login' && method === 'POST') {
-    if (!hasPassword) return sendJSON(res, 400, { error: 'Password login is not enabled' });
-    const ip = clientIP(req);
-    const rec = rateState(ip);
-    if (rec && rec.count >= MAX_ATTEMPTS) {
-      const mins = Math.ceil((LOCK_MS - (Date.now() - rec.first)) / 60000);
-      return sendJSON(res, 429, { error: `Too many attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.` });
-    }
-    const body = await readBody(req);
-    const a = Buffer.from(str(body.password));
-    const b = Buffer.from(HELM_PASSWORD);
-    const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
-    if (!ok) {
-      const next = { count: (rec ? rec.count : 0) + 1, first: rec ? rec.first : Date.now() };
-      attempts.set(ip, next);
-      const remaining = Math.max(0, MAX_ATTEMPTS - next.count);
-      return sendJSON(res, 403, {
-        error: remaining > 0
-          ? `Incorrect password — ${remaining} attempt${remaining > 1 ? 's' : ''} remaining`
-          : 'Too many attempts. Try again later.',
-      });
-    }
-    attempts.delete(ip);
-    setSessionCookie(req, res, makeSession('pw'));
+  // GET /api/health — instant liveness check for Railway/Render
+  if (pathname === '/api/health' && method === 'GET') {
     return sendJSON(res, 200, { ok: true });
   }
-  if (pathname === '/api/logout' && method === 'POST') {
-    clearSessionCookie(req, res);
-    return sendJSON(res, 200, { ok: true });
-  }
-  if (pathname === '/api/auth/google' && method === 'GET') {
-    return handleGoogleCallback(req, res, url);
-  }
-
-  // ---- quick-capture via standalone token (iOS Shortcuts etc.): create-only
-  if (pathname === '/api/capture' && method === 'POST' && (isAuthed(req) || hasCaptureToken(req))) {
-    const body = await readBody(req);
-    const parsed = parseCapture(str(body.text), db.projects);
-    if (!parsed.title) return sendJSON(res, 400, { error: 'Nothing to capture' });
-    delete parsed._projName;
-    const t = sanitizeTask(parsed);
-    db.tasks.push(t);
-    logActivity('task-created', `Added task "${t.title}"`, t.id);
-    saveData();
-    return sendJSON(res, 201, t);
-  }
-
-  // ---- everything past here requires a valid session
-  if (!isAuthed(req)) return sendJSON(res, 401, { error: 'Authentication required' });
 
   // GET /api/state — everything the client needs
   if (pathname === '/api/state' && method === 'GET') {
@@ -638,6 +460,8 @@ async function handleAPI(req, res, pathname, url) {
       tasks: db.tasks,
       activity: db.activity.slice(0, 100),
       settings: { ...safeSettings, hasKey: !!openrouterKey },
+      authEnabled: !!HELM_PASSWORD || useGoogleAuth,
+      googleAuth: useGoogleAuth,
     });
   }
 
@@ -871,17 +695,185 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// ---------------------------------------------------------------- session auth
+// Cookie-based sessions replace HTTP Basic Auth — works in iOS PWA standalone mode
+// where the browser never shows a Basic Auth dialog.
+// Set HELM_PASSWORD env var to enable password protection.
+
+const HELM_PASSWORD = process.env.HELM_PASSWORD || '';
+const HELM_USER = process.env.HELM_USER || 'helm'; // kept for display only
+
+const sessions = new Set(); // in-memory; cleared on restart (forces re-login)
+
+// Google OAuth (optional) — set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + ALLOWED_GOOGLE_EMAIL
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const ALLOWED_GOOGLE_EMAIL = process.env.ALLOWED_GOOGLE_EMAIL || '';
+const useGoogleAuth = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+const oauthStates = new Set(); // CSRF tokens for OAuth flow
+
+// Rate limiter — blocks an IP for 15 min after 5 failed password attempts
+const loginAttempts = new Map(); // ip → { count, until }
+
+function checkRateLimit(ip) {
+  const rec = loginAttempts.get(ip);
+  if (!rec) return true;
+  if (rec.until && Date.now() < rec.until) return false;
+  if (rec.until) loginAttempts.delete(ip); // unblock expired
+  return true;
+}
+
+function recordAttempt(ip, success) {
+  if (success) { loginAttempts.delete(ip); return; }
+  const rec = loginAttempts.get(ip) || { count: 0, until: null };
+  rec.count++;
+  if (rec.count >= 5) { rec.until = Date.now() + 15 * 60 * 1000; console.log(`  ⚠ IP ${ip} locked out after ${rec.count} failed logins`); }
+  loginAttempts.set(ip, rec);
+  if (loginAttempts.size > 10000) { const n = Date.now(); for (const [k, v] of loginAttempts) if (!v.until || v.until < n) loginAttempts.delete(k); }
+}
+
+function parseCookies(header) {
+  const out = {};
+  (header || '').split(';').forEach((part) => {
+    const eq = part.indexOf('=');
+    if (eq < 0) return;
+    out[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+  });
+  return out;
+}
+
+function sessionCookie(token) {
+  return `helm_session=${token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=2592000`; // 30 days
+}
+
+function getBaseURL(req) {
+  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+  return `${proto}://${req.headers['host'] || `localhost:${PORT}`}`;
+}
+
+function createSession() {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.add(token);
+  if (sessions.size > 500) sessions.clear(); // safety valve
+  return token;
+}
+
+function checkAuth(req, res) {
+  if (!HELM_PASSWORD && !useGoogleAuth) return true;
+  const cookies = parseCookies(req.headers['cookie']);
+  if (cookies.helm_session && sessions.has(cookies.helm_session)) return true;
+  sendJSON(res, 401, { error: 'Authentication required' });
+  return false;
+}
+
+// Login handler (password-based)
+async function handleLogin(req, res) {
+  const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
+  if (!checkRateLimit(ip)) {
+    return sendJSON(res, 429, { error: 'Too many failed attempts — try again in 15 minutes' });
+  }
+  if (!HELM_PASSWORD) {
+    // No password configured — grant access unconditionally
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': sessionCookie(createSession()) });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  const body = await readBody(req);
+  const pa = Buffer.from(String(body.password || '').padEnd(64));
+  const pb = Buffer.from(HELM_PASSWORD.padEnd(64));
+  if (crypto.timingSafeEqual(pa, pb)) {
+    recordAttempt(ip, true);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': sessionCookie(createSession()) });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  recordAttempt(ip, false);
+  const rec = loginAttempts.get(ip);
+  const left = rec ? Math.max(0, 5 - rec.count) : 4;
+  return sendJSON(res, 403, { error: `Incorrect password${left > 0 ? ` — ${left} attempt${left !== 1 ? 's' : ''} remaining` : ' — account locked for 15 minutes'}` });
+}
+
+// Logout handler
+function handleLogout(req, res) {
+  const cookies = parseCookies(req.headers['cookie']);
+  if (cookies.helm_session) sessions.delete(cookies.helm_session);
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'helm_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0' });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+// Google OAuth handlers
+async function handleGoogleStart(req, res) {
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates.add(state);
+  setTimeout(() => oauthStates.delete(state), 10 * 60 * 1000);
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID, redirect_uri: getBaseURL(req) + '/auth/callback',
+    response_type: 'code', scope: 'openid email', state, access_type: 'online',
+  });
+  res.writeHead(302, { Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}` });
+  res.end();
+}
+
+async function handleGoogleCallback(req, res, url) {
+  const code = url.searchParams.get('code'), state = url.searchParams.get('state');
+  if (!code || !state || !oauthStates.has(state)) {
+    res.writeHead(302, { Location: '/?error=google_failed' }); return res.end();
+  }
+  oauthStates.delete(state);
+  try {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code, client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET, redirect_uri: getBaseURL(req) + '/auth/callback', grant_type: 'authorization_code' }).toString(),
+    });
+    const tokens = await tokenResp.json().catch(() => ({}));
+    if (!tokenResp.ok) throw new Error(tokens.error || 'Token exchange failed');
+    const userResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+    const user = await userResp.json().catch(() => ({}));
+    if (!userResp.ok) throw new Error('Could not get user info');
+    if (ALLOWED_GOOGLE_EMAIL && user.email?.toLowerCase() !== ALLOWED_GOOGLE_EMAIL.toLowerCase()) {
+      console.log(`  ⚠ Rejected Google login: ${user.email}`);
+      res.writeHead(302, { Location: '/?error=not_allowed' }); return res.end();
+    }
+    console.log(`  ✓ Google login: ${user.email}`);
+    res.writeHead(302, { Location: '/', 'Set-Cookie': sessionCookie(createSession()) });
+    res.end();
+  } catch (err) {
+    console.error('  Google OAuth error:', err.message);
+    res.writeHead(302, { Location: '/?error=google_failed' }); res.end();
+  }
+}
+
 // ---------------------------------------------------------------- server
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
-  // Liveness check for Railway/Render — must bypass auth (the probe has no session).
-  if (pathname === '/api/health' && req.method === 'GET') return sendJSON(res, 200, { ok: true });
+  const method = req.method;
   try {
-    if (pathname === '/auth/google') return handleGoogleStart(req, res);
-    if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname, url);
-    return serveStatic(req, res, pathname);
+    // Always-public endpoints (no session required)
+    if (pathname === '/api/health' && method === 'GET') return sendJSON(res, 200, { ok: true });
+    if (pathname === '/api/auth-info' && method === 'GET') return sendJSON(res, 200, { hasPassword: !!HELM_PASSWORD, hasGoogle: useGoogleAuth });
+    if (pathname === '/api/login' && method === 'POST') return handleLogin(req, res);
+    if (pathname === '/api/logout' && method === 'POST') return handleLogout(req, res);
+    // Quick-capture via standalone token (iOS Shortcuts etc.) or a normal session.
+    if (pathname === '/api/capture' && method === 'POST') {
+      const open = !HELM_PASSWORD && !useGoogleAuth;
+      if (!open && !hasSession(req) && !hasCaptureToken(req)) return sendJSON(res, 401, { error: 'Authentication required' });
+      const body = await readBody(req);
+      const parsed = parseCapture(str(body.text), db.projects);
+      if (!parsed.title) return sendJSON(res, 400, { error: 'Nothing to capture' });
+      delete parsed._projName;
+      const t = sanitizeTask(parsed);
+      db.tasks.push(t);
+      logActivity('task-created', `Added task "${t.title}"`, t.id);
+      saveData();
+      return sendJSON(res, 201, t);
+    }
+    if (useGoogleAuth && pathname === '/auth/google' && method === 'GET') return handleGoogleStart(req, res);
+    if (useGoogleAuth && pathname === '/auth/callback' && method === 'GET') return handleGoogleCallback(req, res, url);
+    // Static files are served without auth so the app shell (login UI) can load.
+    if (!pathname.startsWith('/api/')) return serveStatic(req, res, pathname);
+    // All other API routes require a valid session.
+    if (!checkAuth(req, res)) return;
+    return await handleAPI(req, res, pathname);
   } catch (err) {
     return sendJSON(res, 500, { error: err.message || 'Server error' });
   }
@@ -895,9 +887,9 @@ async function start() {
   reminderTimer = setInterval(() => { fireDueReminders().catch(() => {}); }, 60000);
   setTimeout(() => { fireDueReminders().catch(() => {}); }, 5000);
 
-  // Listen FIRST so the Railway/Render healthcheck passes immediately; connect to
-  // Neon afterwards in the background. (If Neon was slow and we awaited it before
-  // binding the port, the healthcheck would time out and the deploy would fail.)
+  // Listen FIRST so the healthcheck passes immediately, then connect to Neon.
+  // Previously neonLoad() ran before listen() — if Neon was slow the server
+  // never bound to the port and Railway's healthcheck timed out.
   await new Promise((resolve) => {
     server.listen(PORT, HOST, () => {
       const nets = os.networkInterfaces();
@@ -909,26 +901,28 @@ async function start() {
       }
       console.log('');
       console.log('  ⎈ Helm is running');
-      if (authEnabled) {
-        const modes = [hasPassword && 'password', hasGoogle && 'Google'].filter(Boolean).join(' + ');
-        console.log(`    Auth:     ON (${modes})`);
-      } else {
-        console.log('    Auth:     OFF — set HELM_PASSWORD (and/or GOOGLE_CLIENT_ID/SECRET) before exposing this server');
-      }
       console.log(`    Local:    http://localhost:${PORT}`);
       lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
       console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync — connecting…)' : ''}`);
+      if (useGoogleAuth) {
+        console.log(`    Auth:     Google OAuth${ALLOWED_GOOGLE_EMAIL ? ` (${ALLOWED_GOOGLE_EMAIL})` : ' (any Google account)'}`);
+      } else if (HELM_PASSWORD) {
+        console.log(`    Auth:     password protected (rate-limited)`);
+      } else {
+        console.log('    Auth:     ⚠ no password — set HELM_PASSWORD env var before exposing to the internet');
+      }
       console.log('');
       resolve();
     });
   });
 
+  // Now connect to Neon in the background — won't block startup or healthcheck.
   if (useNeon) {
     try {
       await neonLoad();
       console.log('  ☁ Cloud sync: connected to Neon Postgres');
     } catch (err) {
-      console.error('  ☁ Cloud sync FAILED, falling back to local file:', err.message);
+      console.error('  ☁ Cloud sync FAILED (serving local data):', err.message);
     }
   }
 }
@@ -938,7 +932,7 @@ if (require.main === module) start();
 // Exposed for unit tests (node --test). Not part of the HTTP surface.
 module.exports = {
   sanitizeTask, sanitizeProject, nextDue, maybeRolloverMyDay, localDateStr,
-  makeSession, verifySession, mergeById, mergeRemote,
+  mergeById, mergeRemote,
   _setDb: (d) => { db = d; },
   _getDb: () => db,
 };

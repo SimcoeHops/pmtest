@@ -93,22 +93,6 @@ test('maybeRolloverMyDay carries over unfinished items, drops completed ones', (
   assert.equal(srv.maybeRolloverMyDay(), false);         // same day -> no-op
 });
 
-// ---------------------------------------------------------------- sessions
-test('session round-trips and rejects tampering', () => {
-  const tok = srv.makeSession('pw');
-  const ok = srv.verifySession(tok);
-  assert.equal(ok && ok.sub, 'pw');
-  assert.equal(srv.verifySession(tok + 'x'), null);       // tampered signature
-  assert.equal(srv.verifySession('garbage'), null);       // not a token
-  assert.equal(srv.verifySession(''), null);
-  assert.equal(srv.verifySession(null), null);
-  // payload tampered (different sub) invalidates the HMAC
-  const [p, s] = tok.split('.');
-  const forged = Buffer.from('{"sub":"admin","exp":' + (Date.now() + 1e6) + '}').toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  assert.equal(srv.verifySession(forged + '.' + s), null);
-});
-
 // ---------------------------------------------------------------- mergeById
 test('mergeById keeps the newer copy per id and unions both sides', () => {
   const local = [
