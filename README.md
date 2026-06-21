@@ -1,4 +1,3 @@
-# ⎈ Helm
 
 A beautiful, fast, ADHD-friendly project & task manager you run yourself.
 **Zero dependencies** — if you have Node.js, you have Helm.

@@ -96,19 +96,26 @@ if (useNeon) {
 }
 
 async function neonQuery(query, params = []) {
-  const resp = await fetch(neonEndpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Neon-Connection-String': NEON_URL,
-      'Neon-Raw-Text-Output': 'true',
-      'Neon-Array-Mode': 'false',
-    },
-    body: JSON.stringify({ query, params }),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
-  return data; // { rows: [...] }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000); // 10s max — prevents startup hang
+  try {
+    const resp = await fetch(neonEndpoint, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Neon-Connection-String': NEON_URL,
+        'Neon-Raw-Text-Output': 'true',
+        'Neon-Array-Mode': 'false',
+      },
+      body: JSON.stringify({ query, params }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error((data && data.message) || `Neon HTTP ${resp.status}`);
+    return data; // { rows: [...] }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 let lastNeonLoad = 0;
@@ -871,11 +878,48 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// ---------------------------------------------------------------- optional HTTP Basic Auth
+// Set HELM_PASSWORD env var to protect the whole app with a password.
+// Username can be anything (or set HELM_USER; defaults to "helm").
+// When not set the app is open — fine for local LAN, not for the internet.
+
+const HELM_PASSWORD = process.env.HELM_PASSWORD || '';
+const HELM_USER = process.env.HELM_USER || 'helm';
+
+function checkAuth(req, res) {
+  if (!HELM_PASSWORD) return true; // no password configured → open
+  const header = req.headers['authorization'] || '';
+  if (header.startsWith('Basic ')) {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const colon = decoded.indexOf(':');
+    if (colon > -1) {
+      const user = decoded.slice(0, colon);
+      const pass = decoded.slice(colon + 1);
+      // Constant-time comparison to prevent timing attacks.
+      const ua = Buffer.from(user.padEnd(64)), ub = Buffer.from(HELM_USER.padEnd(64));
+      const pa = Buffer.from(pass.padEnd(64)), pb = Buffer.from(HELM_PASSWORD.padEnd(64));
+      const ok = crypto.timingSafeEqual(ua, ub) && crypto.timingSafeEqual(pa, pb);
+      if (ok) return true;
+    }
+  }
+  res.writeHead(401, {
+    'WWW-Authenticate': 'Basic realm="Helm", charset="UTF-8"',
+    'Content-Type': 'text/plain',
+  });
+  res.end('Authentication required');
+  return false;
+}
+
 // ---------------------------------------------------------------- server
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
+  // Health endpoint must bypass auth — Railway's healthcheck has no credentials.
+  if (pathname === '/api/health' && req.method === 'GET') {
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (!checkAuth(req, res)) return;
   try {
     if (pathname === '/auth/google') return handleGoogleStart(req, res);
     if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname, url);
@@ -887,12 +931,41 @@ const server = http.createServer(async (req, res) => {
 
 async function start() {
   loadDataLocal();
+
+  // Listen FIRST so the healthcheck passes immediately, then connect to Neon.
+  // Previously neonLoad() ran before listen() — if Neon was slow the server
+  // never bound to the port and Railway's healthcheck timed out.
+  await new Promise((resolve) => {
+    server.listen(PORT, HOST, () => {
+      const nets = os.networkInterfaces();
+      const lan = [];
+      for (const name of Object.keys(nets)) {
+        for (const ni of nets[name] || []) {
+          if (ni.family === 'IPv4' && !ni.internal) lan.push(ni.address);
+        }
+      }
+      console.log('');
+      console.log('  ⎈ Helm is running');
+      console.log(`    Local:    http://localhost:${PORT}`);
+      lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
+      console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync — connecting…)' : ''}`);
+      if (HELM_PASSWORD) {
+        console.log(`    Auth:     password protected (user: ${HELM_USER})`);
+      } else {
+        console.log('    Auth:     ⚠ no password — set HELM_PASSWORD env var before exposing to the internet');
+      }
+      console.log('');
+      resolve();
+    });
+  });
+
+  // Now connect to Neon in the background — won't block startup or healthcheck.
   if (useNeon) {
     try {
       await neonLoad();
       console.log('  ☁ Cloud sync: connected to Neon Postgres');
     } catch (err) {
-      console.error('  ☁ Cloud sync FAILED, falling back to local file:', err.message);
+      console.error('  ☁ Cloud sync FAILED (serving local data):', err.message);
     }
   }
   // Fire due reminders as Expo push notifications every minute (no-op until a
