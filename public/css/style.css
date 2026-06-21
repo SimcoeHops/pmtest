@@ -43,7 +43,14 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html { -webkit-text-size-adjust: 100%; }
+
+/* ---- iOS native feel core ----------------------------------------- */
+/* Prevents rubber-band overscroll — the #1 thing that says "website" */
+html {
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+  height: 100%;
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   background: var(--bg);
@@ -51,7 +58,54 @@ body {
   font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  height: 100%;
+  overflow: hidden;
 }
+/* The actual scrollable area */
+#main { overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; }
+
+/* Kill the blue tap flash on every touch target */
+* { -webkit-tap-highlight-color: transparent; }
+
+/* Prevent double-tap zoom on buttons/links (iOS quirk) */
+button, a, input, select, textarea, [role="button"] {
+  touch-action: manipulation;
+}
+
+/* No text selection on chrome elements (feels native) */
+button, a, nav, .brand, .chip, .stat .lbl, .stat .num,
+.t-check, .t-act, .nav-ic, .mob-icon, .bcol-head,
+#mobilenav, #topbar, .page-head h1, .section-title {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ---- iOS PWA: fill the true WKWebView frame, not just the visual viewport ---
+   100vh/100dvh on iOS resolves to the visual-viewport height which excludes the
+   status-bar area. In standalone PWA mode the WKWebView covers the FULL screen,
+   so we must use -webkit-fill-available (comes AFTER height:100% in the
+   @supports block so it wins the cascade on WebKit/iOS). The feature test
+   -webkit-touch-callout:none targets iOS Safari exclusively. */
+@supports (-webkit-touch-callout: none) {
+  html   { height: -webkit-fill-available; }
+  body   { height: -webkit-fill-available; }
+  #layout { min-height: -webkit-fill-available; }
+}
+
+/* ---- iOS standalone: push content below the status bar ------------ */
+/* When added to home screen, status bar floats over content.
+   env(safe-area-inset-top) gives us the exact height to compensate. */
+@supports (padding-top: env(safe-area-inset-top)) {
+  #topbar {
+    padding-top: calc(14px + env(safe-area-inset-top));
+    height: calc(60px + env(safe-area-inset-top));
+  }
+  #sidebar {
+    padding-top: calc(18px + env(safe-area-inset-top));
+  }
+}
+
 ::selection { background: var(--accent-soft); }
 button { font: inherit; color: inherit; cursor: pointer; border: none; background: none; }
 input, select, textarea { font: inherit; color: var(--text); }
@@ -68,7 +122,7 @@ kbd {
 
 /* ------------------------------------------------------------ layout */
 
-#layout { display: flex; min-height: 100vh; }
+#layout { display: flex; height: 100%; overflow: hidden; }
 
 #sidebar {
   width: var(--sidebar-w);
@@ -79,7 +133,7 @@ kbd {
   flex-direction: column;
   position: sticky;
   top: 0;
-  height: 100vh;
+  height: 100%;
   padding: 18px 14px;
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; }
@@ -120,7 +174,7 @@ kbd {
 .shortcut-hints { display: flex; gap: 14px; justify-content: center; font-size: 11.5px; color: var(--text-faint); }
 .shortcut-hints span { display: flex; align-items: center; gap: 5px; }
 
-#main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 
 #topbar {
   display: flex; align-items: center; gap: 12px;
@@ -452,6 +506,16 @@ kbd {
 }
 .notes-box:focus { border-color: var(--accent); }
 
+/* ------------------------------------------------------------ view transitions */
+
+#view {
+  animation: view-enter 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
+}
+@keyframes view-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 /* ------------------------------------------------------------ modal */
 
 #modal-root:empty { display: none; }
@@ -464,6 +528,7 @@ kbd {
   padding: 7vh 16px 16px;
   animation: fadein 0.15s ease;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 @keyframes fadein { from { opacity: 0; } }
 @keyframes slideup { from { transform: translateY(14px); opacity: 0; } }
@@ -477,6 +542,18 @@ kbd {
   margin-bottom: 40px;
 }
 .modal.wide { max-width: 740px; }
+
+/* Drag handle on modals (visual cue that it's a sheet) */
+.modal-head::before {
+  content: '';
+  display: block;
+  width: 36px; height: 4px;
+  background: var(--border);
+  border-radius: 4px;
+  margin: 0 auto;
+  position: absolute;
+  top: 8px; left: 50%; transform: translateX(-50%);
+}
 .modal-head { display: flex; align-items: center; gap: 10px; padding: 18px 22px 0; }
 .modal-head h2 { font-size: 17px; font-weight: 700; flex: 1; }
 .modal-body { padding: 16px 22px; display: flex; flex-direction: column; gap: 14px; }
@@ -643,49 +720,110 @@ kbd {
   #sidebar {
     position: fixed; left: 0; top: 0; bottom: 0; z-index: 90;
     transform: translateX(-105%);
-    transition: transform 0.22s ease;
+    transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
     box-shadow: var(--shadow);
-    height: 100dvh;
+    height: 100%;
   }
   #sidebar.open { transform: translateX(0); }
   #btn-menu { display: grid; }
   #btn-capture-top { display: none; }
-  #view { padding: 18px 14px 110px; }
-  #topbar { padding: 10px 14px; }
 
+  /* Scrollable view area — sits between topbar and mobilenav */
+  #view {
+    padding: 18px 14px 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    flex: 1;
+    /* Bottom padding = nav height + safe area so content isn't hidden behind tab bar */
+    padding-bottom: calc(80px + env(safe-area-inset-bottom));
+  }
+
+  /* Topbar: horizontal padding only on mobile (vertical handled by safe-area above) */
+  #topbar { padding-left: 14px; padding-right: 14px; }
+
+  /* ---- iOS-style tab bar ---------------------------------------- */
   #mobilenav {
     display: flex;
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 80;
-    background: color-mix(in srgb, var(--bg-soft) 88%, transparent);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border-top: 1px solid var(--border-soft);
-    padding: 8px 6px calc(8px + env(safe-area-inset-bottom));
+    background: color-mix(in srgb, var(--bg-soft) 92%, transparent);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-top: 0.5px solid var(--border-soft);
+    /* Safe area = home indicator on iPhone X+ */
+    padding: 10px 4px calc(10px + env(safe-area-inset-bottom));
     justify-content: space-around;
     align-items: center;
+    flex-shrink: 0;
   }
   #mobilenav a {
-    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
     color: var(--text-faint);
-    font-size: 19px;
-    min-width: 56px;
-    padding: 3px 0;
+    min-width: 52px; min-height: 44px; /* Apple HIG minimum touch target */
+    padding: 2px 8px;
+    border-radius: 10px;
+    transition: color 0.15s;
+    justify-content: center;
   }
-  #mobilenav a span { font-size: 10px; font-weight: 600; }
   #mobilenav a.active { color: var(--accent); }
+  .mob-icon {
+    font-size: 22px;
+    display: block;
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  #mobilenav a.active .mob-icon { transform: scale(1.12); }
+  #mobilenav a span:not(.mob-icon) { font-size: 10px; font-weight: 600; letter-spacing: 0.01em; }
+
+  /* The center FAB */
   .mob-fab {
     background: var(--grad);
     color: #fff !important;
-    width: 50px; height: 50px;
-    border-radius: 50%;
-    display: grid !important; place-items: center;
-    font-size: 26px !important;
-    margin-top: -22px;
-    box-shadow: 0 6px 18px rgba(109, 111, 251, 0.5);
+    width: 52px; height: 52px;
+    border-radius: 16px; /* squircle-ish, not just a circle */
+    display: flex !important;
+    align-items: center; justify-content: center;
+    font-size: 28px !important;
+    margin-top: -16px;
+    box-shadow: 0 6px 20px rgba(109, 111, 251, 0.55);
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
+  .mob-fab:active { transform: scale(0.93); }
   .mob-fab span { display: none; }
+
+  /* ---- Bottom-sheet modals (feels truly native on iPhone) ------- */
+  .modal-overlay {
+    align-items: flex-end;
+    padding: 0;
+    /* Allow the sheet itself to scroll, not the overlay */
+    overflow: hidden;
+  }
+  .modal {
+    border-radius: 20px 20px 0 0;
+    border-bottom: none;
+    max-width: 100%;
+    width: 100%;
+    max-height: 92dvh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    animation: sheet-up 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+    margin-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  @keyframes sheet-up {
+    from { transform: translateY(100%); }
+    to   { transform: translateY(0); }
+  }
+  /* The drag handle pill on mobile */
+  .modal-head { padding-top: 24px; position: relative; }
+
   .stat .num { font-size: 22px; }
   .report-paper { padding: 20px 18px; }
+  .board { padding-bottom: 12px; }
+
+  /* Bigger touch targets on task rows */
+  .t-check { width: 26px; height: 26px; }
+  .t-act { width: 34px; height: 34px; }
 }
 
 /* sidebar scrim on mobile */
@@ -693,6 +831,105 @@ kbd {
   position: fixed; inset: 0; z-index: 85;
   background: rgba(0, 0, 0, 0.45);
   animation: fadein 0.2s;
+}
+
+/* ------------------------------------------------------------ login screen */
+
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 24px 16px env(safe-area-inset-bottom, 24px);
+}
+.login-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 44px 32px 36px;
+  width: 100%;
+  max-width: 380px;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+  animation: view-enter 0.3s ease;
+}
+.login-mark {
+  font-size: 52px;
+  line-height: 1;
+  margin-bottom: 10px;
+}
+.login-title {
+  font-size: 26px;
+  font-weight: 700;
+  margin: 0 0 4px;
+  background: var(--grad);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.login-sub {
+  color: var(--text-faint);
+  margin: 0 0 28px;
+  font-size: 14px;
+}
+.btn-google {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  width: 100%;
+  box-sizing: border-box;
+}
+.btn-google:hover { border-color: var(--accent); background: var(--card-2); }
+.login-divider {
+  color: var(--text-faint);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 18px 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.login-divider::before, .login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+#login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.login-input {
+  width: 100%;
+  padding: 13px 15px;
+  font-size: 16px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+  -webkit-appearance: none;
+}
+.login-input:focus { outline: none; border-color: var(--accent); }
+.login-err {
+  color: var(--red);
+  font-size: 13px;
+  margin: 6px 0 0;
+  text-align: center;
 }
 
 /* ------------------------------------------------------------ print (boss report) */
@@ -704,4 +941,43 @@ kbd {
   .report-paper { border: none; padding: 0; max-width: none; background: #fff; color: #111; }
   .report-paper h2 { border-color: #ccc; }
   .report-paper .muted { color: #555; }
+}
+
+/* ============================================================ command palette (⌘K) */
+.modal.cmdk-modal { max-width: 600px; overflow: hidden; padding: 0; }
+.cmdk { display: flex; flex-direction: column; max-height: 70vh; }
+.cmdk-input {
+  width: 100%; border: none; background: transparent; color: var(--text);
+  font-size: 17px; padding: 18px 20px; outline: none;
+  border-bottom: 1px solid var(--border); border-radius: 18px 18px 0 0;
+}
+.cmdk-input::placeholder { color: var(--text-faint); }
+.cmdk-list { overflow-y: auto; padding: 8px; flex: 1; -webkit-overflow-scrolling: touch; }
+.cmdk-row {
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 12px; border-radius: 10px; cursor: pointer; user-select: none;
+}
+.cmdk-row.sel { background: var(--accent-soft); }
+.cmdk-ic { width: 22px; text-align: center; color: var(--text-dim); flex: none; }
+.cmdk-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmdk-hint { color: var(--text-faint); font-size: 12.5px; margin-left: 8px; }
+.cmdk-key {
+  font-size: 11px; color: var(--text-faint); border: 1px solid var(--border);
+  border-radius: 6px; padding: 1px 6px; flex: none;
+}
+.cmdk-act {
+  width: 30px; height: 30px; border-radius: 8px; flex: none;
+  border: 1px solid transparent; background: transparent; color: var(--text-dim);
+  cursor: pointer; opacity: 0; transition: opacity .12s, background .12s, color .12s;
+}
+.cmdk-row.sel .cmdk-act, .cmdk-row:hover .cmdk-act { opacity: 1; }
+.cmdk-act:hover { background: var(--card-2); color: var(--text); }
+.cmdk-empty { padding: 26px; text-align: center; color: var(--text-faint); }
+.cmdk-foot {
+  display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--border);
+  color: var(--text-faint); font-size: 12px; flex-wrap: wrap;
+}
+.cmdk-foot kbd {
+  border: 1px solid var(--border); border-radius: 5px; padding: 0 5px; margin-right: 3px;
+  font-size: 11px; background: var(--card-2);
 }

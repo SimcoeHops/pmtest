@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "Helm",
+    "slug": "helm-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "helm",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "backgroundColor": "#0d1017",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "color": "#6d6ffb"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

@@ -4,7 +4,8 @@
   "description": "Helm — a beautiful, ADHD-friendly project & task manager for IT managers. Zero dependencies.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

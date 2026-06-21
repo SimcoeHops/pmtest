@@ -16,6 +16,12 @@ async function api(path, method = 'GET', body) {
     opts.body = JSON.stringify(body);
   }
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    requireReauth();
+    const e = new Error('Session expired — please log in');
+    e.isAuthError = true;
+    throw e;
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
@@ -24,6 +30,11 @@ async function api(path, method = 'GET', body) {
 async function loadState() {
   S = await api('/api/state');
   applyTheme();
+  // Report our timezone so the server fires reminders at the right wall-clock.
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (tz && S.settings.tz !== tz) S.settings = await api('/api/settings', 'PATCH', { tz });
+  } catch (_) { /* non-fatal */ }
 }
 
 // ------------------------------------------------------------ utilities
@@ -150,42 +161,9 @@ function confirmModal(title, body, action, danger = true) {
 // ------------------------------------------------------------ quick capture parsing
 // Syntax:  Fix the VPN @Infra #network !high ^fri  *also supports ^today ^tomorrow ^2026-07-01
 
-const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
-
+// Parsing lives in the shared, unit-tested HelmCapture module (js/capture.js).
 function parseCapture(text) {
-  const out = { title: '', tags: [], projectIds: [], priority: 'medium', due: null, today: false };
-  const leftovers = [];
-  for (const tok of text.split(/\s+/)) {
-    if (!tok) continue;
-    if (tok.startsWith('#') && tok.length > 1) { out.tags.push(tok.slice(1).toLowerCase()); continue; }
-    if (tok.startsWith('!') && tok.length > 1) {
-      const v = tok.slice(1).toLowerCase();
-      const map = { critical: 'critical', crit: 'critical', '1': 'critical', high: 'high', hi: 'high', '2': 'high', med: 'medium', medium: 'medium', '3': 'medium', low: 'low', '4': 'low' };
-      if (map[v]) { out.priority = map[v]; continue; }
-    }
-    if (tok.startsWith('@') && tok.length > 1) {
-      const q = tok.slice(1).toLowerCase();
-      const p = S.projects.find((pr) => pr.status !== 'archived' && pr.name.toLowerCase().replace(/\s+/g, '').startsWith(q))
-        || S.projects.find((pr) => pr.name.toLowerCase().includes(q));
-      if (p) { out.projectIds.push(p.id); out._projName = p.name; continue; }
-    }
-    if (tok.startsWith('^') && tok.length > 1) {
-      const v = tok.slice(1).toLowerCase();
-      if (v === 'today') { out.due = todayStr(); out.today = true; continue; }
-      if (v === 'tomorrow' || v === 'tom') { out.due = addDays(null, 1); continue; }
-      if (v === 'nextweek' || v === 'week') { out.due = addDays(null, 7); continue; }
-      if (v === 'eom') { const d = new Date(); out.due = new Date(d.getFullYear(), d.getMonth() + 1, 0, 12).toISOString().slice(0, 10); continue; }
-      const wd = WEEKDAYS.findIndex((w) => v.startsWith(w));
-      if (wd >= 0) {
-        let n = (wd - new Date().getDay() + 7) % 7; if (n === 0) n = 7;
-        out.due = addDays(null, n); continue;
-      }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) { out.due = v; continue; }
-    }
-    leftovers.push(tok);
-  }
-  out.title = leftovers.join(' ');
-  return out;
+  return HelmCapture.parseCapture(text, S.projects);
 }
 
 function captureChips(p) {
@@ -624,7 +602,16 @@ function workloadContext({ projectId = null, includeDone = true } = {}) {
 
 // ------------------------------------------------------------ views
 
-function setView(html) { $('#view').innerHTML = html; }
+function setView(html) {
+  const v = $('#view');
+  v.innerHTML = html;
+  // Re-trigger the CSS entry animation on each view change.
+  v.style.animation = 'none';
+  v.offsetHeight; // force reflow
+  v.style.animation = '';
+  // Scroll back to top on every navigation.
+  v.scrollTo ? v.scrollTo(0, 0) : (v.scrollTop = 0);
+}
 
 function navHighlight() {
   $$('#nav a, #mobilenav a').forEach((a) => {
@@ -1207,6 +1194,11 @@ function viewSettings() {
       </div>
 
       <button class="btn btn-primary" id="st-save" style="align-self:flex-start">Save settings</button>
+      ${S.authEnabled ? `<div class="card" style="border-color:var(--red-soft)">
+        <div class="section-title" style="color:var(--red)">Sign out</div>
+        <p class="hint" style="margin-bottom:12px">Signs out of this device. You'll need to sign in again to access Helm.</p>
+        <button class="btn" id="st-logout" style="border-color:var(--red);color:var(--red)">Sign out of Helm</button>
+      </div>` : ''}
       <p class="hint">Helm v1 · keyboard: <kbd>N</kbd> capture · <kbd>P</kbd> new project · <kbd>/</kbd> search · <kbd>1–6</kbd> switch views</p>
     </div>
   `);
@@ -1237,6 +1229,11 @@ function viewSettings() {
   };
   const test = $('#st-test');
   if (test) test.onclick = () => aiModal('Connection test', 'Reply with a one-line confirmation that you are reachable, plus a fun fact about lighthouses.', 'Be brief.');
+  const logoutBtn = $('#st-logout');
+  if (logoutBtn) logoutBtn.onclick = async () => {
+    await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+    showLoginScreen();
+  };
   $('#st-restore').onclick = () => $('#st-file').click();
   $('#st-file').onchange = async (e) => {
     const file = e.target.files[0];
@@ -1330,7 +1327,137 @@ $('#search').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { searchQuery = ''; e.target.value = ''; e.target.blur(); render(); }
 });
 
+// ------------------------------------------------------------ command palette (⌘/Ctrl-K)
+
+function fuzzyScore(q, text) {
+  if (!q) return 0;
+  text = (text || '').toLowerCase();
+  const idx = text.indexOf(q);
+  if (idx >= 0) return 1000 - idx - Math.max(0, text.length - q.length) * 0.05; // substring wins
+  let ti = 0, gaps = 0;
+  for (let qi = 0; qi < q.length; qi++) {
+    const found = text.indexOf(q[qi], ti);
+    if (found < 0) return -1;
+    if (qi > 0 && found > ti) gaps++;
+    ti = found + 1;
+  }
+  return 200 - gaps * 5;
+}
+
+function paletteItems() {
+  const items = [];
+  const go = (hash) => () => { closeModal(); location.hash = hash; };
+  // Commands / navigation — always available.
+  items.push(
+    { type: 'cmd', icon: '＋', label: 'New task', hint: 'Quick capture', keys: 'N', run: () => { closeModal(); captureModal(); } },
+    { type: 'cmd', icon: '▣', label: 'New project', keys: 'P', run: () => { closeModal(); projectModal(); } },
+    { type: 'cmd', icon: '◈', label: 'Go to Dashboard', keys: '1', run: go('#/dashboard') },
+    { type: 'cmd', icon: '☀', label: 'Go to My Day', keys: '2', run: go('#/today') },
+    { type: 'cmd', icon: '▣', label: 'Go to Projects', keys: '3', run: go('#/projects') },
+    { type: 'cmd', icon: '☑', label: 'Go to Tasks', keys: '4', run: go('#/tasks') },
+    { type: 'cmd', icon: '⫿', label: 'Go to Board', keys: '5', run: go('#/board') },
+    { type: 'cmd', icon: '⎙', label: 'Go to Report', keys: '6', run: go('#/report') },
+    { type: 'cmd', icon: '⚙', label: 'Go to Settings', run: go('#/settings') },
+    { type: 'cmd', icon: '🔔', label: 'Show alerts & reminders', run: () => { closeModal(); alertsPanel(); } },
+    { type: 'cmd', icon: '◐', label: 'Toggle light / dark theme', run: async () => { closeModal(); $('#btn-theme').click(); } },
+  );
+  // Projects.
+  for (const p of S.projects) {
+    if (p.status === 'archived') continue;
+    items.push({
+      type: 'project', icon: '▣', color: p.color,
+      label: p.name, hint: PSTATUS_LABEL[p.status],
+      haystack: `${p.name} ${p.area || ''} ${p.description || ''}`,
+      run: () => { closeModal(); location.hash = `#/project/${p.id}`; },
+    });
+  }
+  // Tasks (open first, then a few done).
+  const open = S.tasks.filter((t) => t.status !== 'done');
+  const done = S.tasks.filter((t) => t.status === 'done');
+  for (const t of [...open, ...done]) {
+    const projs = t.projectIds.map(projById).filter(Boolean).map((p) => p.name).join(', ');
+    const hintBits = [];
+    if (projs) hintBits.push('▣ ' + projs);
+    if (t.due) hintBits.push('📅 ' + fmtDue(t.due));
+    if (t.status === 'done') hintBits.push('done');
+    items.push({
+      type: 'task', icon: t.status === 'done' ? '☑' : '☐',
+      label: t.title, hint: hintBits.join(' · '),
+      haystack: `${t.title} ${t.tags.map((x) => '#' + x).join(' ')} ${t.notes}`,
+      rank: t.status === 'done' ? -50 : 0,
+      run: () => { closeModal(); taskModal(t.id); },
+      actions: [
+        { icon: '✓', title: 'Complete', run: () => { toggleTask(t.id); } },
+        { icon: '☀', title: t.today ? 'Remove from My Day' : 'Add to My Day',
+          run: async () => { await patchTask(t.id, { today: !t.today }); toast(t.today ? '☀ On My Day' : 'Off My Day'); render(); } },
+      ],
+    });
+  }
+  return items;
+}
+
+function commandPalette() {
+  if ($('.cmdk')) return;
+  const all = paletteItems();
+  const m = openModal(`
+    <div class="cmdk">
+      <input id="cmdk-in" class="cmdk-input" placeholder="Search tasks, projects, commands…  (try a tag, a name, or “new task”)" autocomplete="off" spellcheck="false">
+      <div class="cmdk-list" id="cmdk-list"></div>
+      <div class="cmdk-foot"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>↵</kbd> open</span><span><kbd>esc</kbd> close</span></div>
+    </div>`);
+  m.classList.add('cmdk-modal');
+  const input = $('#cmdk-in', m);
+  const list = $('#cmdk-list', m);
+  let results = [];
+  let sel = 0;
+
+  function compute(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return all.filter((i) => i.type === 'cmd').concat(all.filter((i) => i.type !== 'cmd').slice(0, 6));
+    return all
+      .map((i) => ({ i, s: fuzzyScore(q, i.haystack || i.label) + (i.rank || 0) }))
+      .filter((x) => x.s > -1)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 14)
+      .map((x) => x.i);
+  }
+  function draw() {
+    list.innerHTML = results.map((it, n) => `
+      <div class="cmdk-row ${n === sel ? 'sel' : ''}" data-n="${n}">
+        <span class="cmdk-ic" ${it.color ? `style="color:${esc(it.color)}"` : ''}>${it.icon}</span>
+        <span class="cmdk-label">${esc(it.label)}${it.hint ? `<span class="cmdk-hint">${esc(it.hint)}</span>` : ''}</span>
+        ${it.keys ? `<kbd class="cmdk-key">${it.keys}</kbd>` : ''}
+        ${(it.actions || []).map((a, ai) => `<button class="cmdk-act" data-n="${n}" data-ai="${ai}" title="${esc(a.title)}">${a.icon}</button>`).join('')}
+      </div>`).join('') || `<div class="cmdk-empty">No matches</div>`;
+    const selEl = $('.cmdk-row.sel', list);
+    if (selEl) selEl.scrollIntoView({ block: 'nearest' });
+  }
+  function refresh() { results = compute(input.value); sel = 0; draw(); }
+  function activate(n) { const it = results[n]; if (it) it.run(); }
+
+  list.addEventListener('click', (e) => {
+    const actBtn = e.target.closest('.cmdk-act');
+    if (actBtn) { e.stopPropagation(); results[+actBtn.dataset.n].actions[+actBtn.dataset.ai].run(); return; }
+    const row = e.target.closest('.cmdk-row');
+    if (row) activate(+row.dataset.n);
+  });
+  list.addEventListener('mousemove', (e) => {
+    const row = e.target.closest('.cmdk-row');
+    if (row && +row.dataset.n !== sel) { sel = +row.dataset.n; draw(); }
+  });
+  input.addEventListener('input', refresh);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(sel + 1, results.length - 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(sel - 1, 0); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); activate(sel); }
+  });
+  refresh();
+}
+
 document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
+    e.preventDefault(); commandPalette(); return;
+  }
   const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
   if (e.key === 'Escape' && $('#modal-root').innerHTML) { closeModal(); return; }
   if (inField || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -1436,12 +1563,92 @@ function dailyDigest() {
 
 $('#btn-bell').onclick = alertsPanel;
 
+// ------------------------------------------------------------ auth / login screen
+
+let _reauthing = false;
+function requireReauth() {
+  if (_reauthing || document.querySelector('.login-screen')) return;
+  _reauthing = true;
+  showLoginScreen().finally(() => { _reauthing = false; });
+}
+
+async function showLoginScreen() {
+  const info = await fetch('/api/auth-info').then((r) => r.json()).catch(() => ({ hasPassword: true, hasGoogle: false }));
+  const errParam = new URLSearchParams(location.search).get('error');
+  const errMsg = errParam === 'not_allowed' ? 'That Google account is not authorized to access Helm.'
+    : errParam ? 'Sign-in failed. Please try again.' : '';
+
+  const googleBtn = info.hasGoogle
+    ? `<a href="/auth/google" class="btn-google"><svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.36-8.16 2.36-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Sign in with Google</a>`
+    : '';
+
+  const passForm = info.hasPassword
+    ? `<form id="login-form">${info.hasGoogle ? '<div class="login-divider">or use password</div>' : ''}
+      <input id="login-pass" type="password" class="login-input" placeholder="Password" autocomplete="current-password">
+      <button type="submit" class="btn btn-primary btn-block">Unlock ⎈</button>
+    </form>
+    <p id="login-err" class="login-err" hidden></p>` : '';
+
+  document.getElementById('view').innerHTML = `
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="login-mark">⎈</div>
+        <h1 class="login-title">Helm</h1>
+        <p class="login-sub">Sign in to continue</p>
+        ${errMsg ? `<p class="login-err" style="display:block;margin-bottom:16px">${esc(errMsg)}</p>` : ''}
+        ${googleBtn}
+        ${passForm}
+      </div>
+    </div>`;
+
+  const form = document.getElementById('login-form');
+  if (form) {
+    const passEl = document.getElementById('login-pass');
+    const errEl = document.getElementById('login-err');
+    setTimeout(() => passEl?.focus(), 100);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      errEl.hidden = true;
+      const btn = form.querySelector('button[type=submit]');
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: passEl.value }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          passEl.value = '';
+          await loadState();
+          render();
+          updateBell();
+        } else {
+          errEl.textContent = data.error || 'Incorrect password';
+          errEl.hidden = false;
+          passEl.value = '';
+          passEl.focus();
+          btn.disabled = false;
+          btn.textContent = 'Unlock ⎈';
+        }
+      } catch (err) {
+        errEl.textContent = 'Could not reach server — try again';
+        errEl.hidden = false;
+        btn.disabled = false;
+        btn.textContent = 'Unlock ⎈';
+      }
+    };
+  }
+}
+
 // ------------------------------------------------------------ boot
 
 (async function boot() {
   try {
     await loadState();
   } catch (err) {
+    if (err.isAuthError) return; // showLoginScreen already called via requireReauth()
     setView(`<div class="empty"><span class="big">⚠</span>Could not reach the Helm server.<br>${esc(err.message)}</div>`);
     return;
   }

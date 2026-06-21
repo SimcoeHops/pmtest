@@ -30,6 +30,23 @@ trivially easy to back up).
 2. The terminal prints a `Network:` URL (e.g. `http://192.168.1.20:4321`) — open it in Safari on your phone.
 3. Tap **Share → Add to Home Screen**. Helm installs as a full-screen app with its own icon.
 
+### Capture from anywhere on iPhone (Shortcut)
+
+Set `HELM_CAPTURE_TOKEN` to any random string, then make a one-action iOS
+Shortcut so you can capture a task from the share sheet, the Home Screen, or
+"Hey Siri" — no need to open the app:
+
+1. **Shortcuts app → +** → add **Get Contents of URL**.
+2. URL: `https://<your-helm-host>/api/capture`
+3. Method: **POST**; Headers: `Content-Type: application/json`,
+   `X-Helm-Token: <your token>`.
+4. Request Body: **JSON** → key `text`, value: the Shortcut input (e.g. "Ask
+   for Input" or the Share Sheet text).
+5. Name it "Capture to Helm". Done — it accepts the full smart syntax
+   (`Pay rent @Home #bills !high ^fri`).
+
+The token only allows creating tasks, never reading your data.
+
 ### Run it on login (optional)
 
 - **Mac:** `crontab -e` → `@reboot cd /path/to/helm && /usr/local/bin/node server.js`, or make a LaunchAgent.
@@ -101,6 +118,7 @@ Windows machine, and continue where you left off.
 
 | Key | Action |
 |-----|--------|
+| `⌘/Ctrl + K` | Command palette (search + jump + act anywhere) |
 | `N` or `Q` | Quick capture |
 | `P` | New project |
 | `/` | Search |
@@ -115,9 +133,30 @@ Windows machine, and continue where you left off.
 | `PORT` | `4321` | HTTP port |
 | `HOST` | `0.0.0.0` | Bind address (already LAN-accessible) |
 | `DATABASE_URL` | – | Optional Neon Postgres cloud sync |
+| `HELM_PASSWORD` | – | Enables password login (the "Unlock" screen) |
+| `GOOGLE_CLIENT_ID` | – | Enables "Sign in with Google" (with the secret) |
+| `GOOGLE_CLIENT_SECRET` | – | Google OAuth client secret |
+| `GOOGLE_REDIRECT_URI` | auto | Override the OAuth callback URL (defaults to `<origin>/api/auth/google`) |
+| `HELM_ALLOWED_EMAILS` | – | Comma-separated allowlist for Google sign-in (empty = any verified Google account) |
+| `SESSION_SECRET` | derived | HMAC key for session cookies. Set a stable value to keep sessions across restarts |
+| `HELM_CAPTURE_TOKEN` | – | Standalone token that authorizes quick-capture only (for iOS Shortcuts / automations) |
 
 ## A note on security
 
-Helm has no authentication — it's designed for your own machines on your
-own network. Don't expose the port to the open internet; if you want remote
-access, put it behind Tailscale/WireGuard or a reverse proxy with auth.
+Helm supports **password and/or Google sign-in** (see the env vars above):
+
+- **Neither set → the server runs OPEN.** That's fine for localhost or a trusted
+  LAN, but don't expose an open instance to the internet. Put it behind
+  Tailscale/WireGuard, or set a password.
+- **`HELM_PASSWORD` set →** every API call requires a session; visitors get an
+  "Unlock" screen. Sessions are stateless signed cookies (HMAC, HttpOnly,
+  SameSite=Lax, Secure over HTTPS) valid for 30 days. Failed logins are
+  rate-limited (5 attempts, then a 15-minute lockout per IP).
+- **`GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` set →** a "Sign in with Google"
+  button appears. Register `https://<your-host>/api/auth/google` as an authorized
+  redirect URI in the Google Cloud console, and (recommended) restrict access
+  with `HELM_ALLOWED_EMAILS`.
+
+> The hosted instance on Railway runs with auth enabled — this repo's `server.js`
+> reproduces that behavior. The mobile app authenticates against the same
+> password/session flow.

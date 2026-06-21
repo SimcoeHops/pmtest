@@ -9,12 +9,37 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { parseCapture } = require('./public/js/capture.js'); // shared with the browser
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4321;
 const HOST = process.env.HOST || '0.0.0.0';
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'helm.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// ---------------------------------------------------------------- auth config
+/* Auth is enabled when a password and/or Google OAuth is configured via env.
+ * With neither set, the server runs OPEN (handy for localhost). Sessions are
+ * stateless signed cookies (HMAC) — zero-dependency, survive restarts as long
+ * as SESSION_SECRET is stable. */
+const HELM_PASSWORD = process.env.HELM_PASSWORD || '';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || '';
+const ALLOWED_EMAILS = (process.env.HELM_ALLOWED_EMAILS || '')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const hasPassword = !!HELM_PASSWORD;
+const hasGoogle = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+const authEnabled = hasPassword || hasGoogle;
+const SESSION_SECRET = process.env.SESSION_SECRET
+  || (authEnabled
+    ? crypto.createHash('sha256').update('helm:' + HELM_PASSWORD + ':' + GOOGLE_CLIENT_SECRET).digest('hex')
+    : crypto.randomBytes(32).toString('hex'));
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const COOKIE = 'helm_session';
+// A standalone token that authorizes ONLY quick-capture (creating tasks), for
+// iOS Shortcuts / automations that can't carry a login session.
+const CAPTURE_TOKEN = process.env.HELM_CAPTURE_TOKEN || '';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -36,12 +61,15 @@ function defaultData() {
     projects: [],
     tasks: [],
     activity: [],
+    pushTokens: [], // [{ token, platform, addedAt }] — Expo push targets
     settings: {
       userName: '',
       theme: 'dark',
       openrouterKey: '',
       openrouterModel: 'anthropic/claude-sonnet-4.5',
       weekStart: 'monday',
+      lastRollover: '', // date (YYYY-MM-DD) My Day was last rolled over
+      tz: '', // IANA timezone (e.g. America/New_York) reported by the client
     },
   };
 }
@@ -53,8 +81,11 @@ let db = defaultData();
  * and the whole document is stored in Postgres via Neon's HTTP SQL endpoint
  * (no driver needed). The local JSON file is still written as a backup.
  * Run the server on any number of machines pointed at the same DATABASE_URL
- * and they share data (last-writer-wins; state is re-pulled every few
- * seconds of idle, so switching devices Just Works for a single user).
+ * and they share data. Saves are NOT blind last-writer-wins: before each write
+ * we re-read the cloud copy and, if another device wrote since we last synced,
+ * merge entity-by-entity (newer `updatedAt` wins per task/project) so a second
+ * device's edits aren't clobbered. (Known limit: a delete on one device can be
+ * resurrected by another device that still holds an older copy — no tombstones.)
  */
 const NEON_URL = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || '';
 const useNeon = /^postgres(ql)?:\/\//.test(NEON_URL);
@@ -81,19 +112,55 @@ async function neonQuery(query, params = []) {
 }
 
 let lastNeonLoad = 0;
+let lastSyncedRev = 0; // updated_at (ms) of the cloud copy we last read or wrote
 
 function hydrate(raw) {
   db = Object.assign(defaultData(), raw);
   db.settings = Object.assign(defaultData().settings, (raw && raw.settings) || {});
 }
 
+const SELECT_DOC = `SELECT doc, (EXTRACT(EPOCH FROM updated_at)*1000)::bigint AS ts FROM helm_store WHERE id = 'main'`;
+const parseRow = (row) => ({
+  doc: typeof row.doc === 'string' ? JSON.parse(row.doc) : row.doc,
+  ts: Number(row.ts) || 0,
+});
+
+// Merge two arrays of {id, ...} keeping whichever copy has the later tsField.
+function mergeById(localArr, remoteArr, tsField) {
+  const byId = new Map();
+  for (const it of remoteArr || []) if (it && it.id) byId.set(it.id, it);
+  for (const it of localArr || []) {
+    if (!it || !it.id) continue;
+    const r = byId.get(it.id);
+    if (!r) { byId.set(it.id, it); continue; }
+    const lt = Date.parse(it[tsField]) || 0;
+    const rt = Date.parse(r[tsField]) || 0;
+    byId.set(it.id, lt >= rt ? it : r);
+  }
+  return [...byId.values()];
+}
+
+// Entity-level merge of the remote cloud doc into our in-memory db.
+function mergeRemote(remote) {
+  if (!remote) return;
+  db.projects = mergeById(db.projects, remote.projects, 'updatedAt');
+  db.tasks = mergeById(db.tasks, remote.tasks, 'updatedAt');
+  const act = new Map();
+  for (const a of [...(remote.activity || []), ...(db.activity || [])]) if (a && a.id) act.set(a.id, a);
+  db.activity = [...act.values()].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(0, 400);
+  // Settings: this device's values win, but fill any gaps from the cloud copy.
+  db.settings = Object.assign({}, remote.settings, db.settings);
+  if (remote.pushTokens) db.pushTokens = remote.pushTokens; // managed server-side; cloud is source
+}
+
 async function neonLoad() {
   await neonQuery(`CREATE TABLE IF NOT EXISTS helm_store (
     id text PRIMARY KEY, doc jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
-  const { rows } = await neonQuery(`SELECT doc FROM helm_store WHERE id = 'main'`);
+  const { rows } = await neonQuery(SELECT_DOC);
   if (rows && rows.length) {
-    const doc = typeof rows[0].doc === 'string' ? JSON.parse(rows[0].doc) : rows[0].doc;
+    const { doc, ts } = parseRow(rows[0]);
     hydrate(doc);
+    lastSyncedRev = ts;
   }
   lastNeonLoad = Date.now();
 }
@@ -102,15 +169,37 @@ async function neonLoad() {
 async function maybeRefreshFromNeon() {
   if (!useNeon || saveTimer || Date.now() - lastNeonLoad < 10000) return;
   try {
-    const { rows } = await neonQuery(`SELECT doc FROM helm_store WHERE id = 'main'`);
+    const { rows } = await neonQuery(SELECT_DOC);
     if (rows && rows.length) {
-      const doc = typeof rows[0].doc === 'string' ? JSON.parse(rows[0].doc) : rows[0].doc;
+      const { doc, ts } = parseRow(rows[0]);
       hydrate(doc);
+      lastSyncedRev = ts;
     }
     lastNeonLoad = Date.now();
   } catch (err) {
     console.error('Neon refresh failed (serving local copy):', err.message);
   }
+}
+
+// Pull-before-save: merge any newer cloud changes, then write the merged doc.
+async function neonSave() {
+  try {
+    const { rows } = await neonQuery(SELECT_DOC);
+    if (rows && rows.length) {
+      const { doc, ts } = parseRow(rows[0]);
+      if (ts > lastSyncedRev) mergeRemote(doc); // another device wrote since we synced
+    }
+  } catch (err) {
+    console.error('Neon pre-save read failed (writing local state anyway):', err.message);
+  }
+  const { rows } = await neonQuery(
+    `INSERT INTO helm_store (id, doc, updated_at) VALUES ('main', $1::jsonb, now())
+     ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()
+     RETURNING (EXTRACT(EPOCH FROM updated_at)*1000)::bigint AS ts`,
+    [JSON.stringify(db)]
+  );
+  lastSyncedRev = (rows && rows[0] && Number(rows[0].ts)) || Date.now();
+  lastNeonLoad = Date.now();
 }
 
 function loadDataLocal() {
@@ -140,28 +229,30 @@ function saveData() {
     saveTimer = null;
     try { persistLocal(); } catch (err) { console.error('Failed to save data:', err.message); }
     if (useNeon) {
-      try {
-        await neonQuery(
-          `INSERT INTO helm_store (id, doc, updated_at) VALUES ('main', $1::jsonb, now())
-           ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()`,
-          [JSON.stringify(db)]
-        );
-        lastNeonLoad = Date.now();
-      } catch (err) {
-        console.error('Neon save failed (local copy is safe):', err.message);
-      }
+      try { await neonSave(); }
+      catch (err) { console.error('Neon save failed (local copy is safe):', err.message); }
     }
   }, 150);
 }
 
-process.on('exit', () => {
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    try { persistLocal(); } catch (_) {}
+// Flush any pending debounced write before exiting so the last edit reaches the
+// cloud, not just the local file.
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (saveTimer) clearTimeout(saveTimer);
+  try { persistLocal(); } catch (_) {}
+  if (useNeon) {
+    try { await neonSave(); } catch (err) { console.error('Neon flush on shutdown failed:', err.message); }
   }
+  process.exit(0);
+}
+process.on('exit', () => {
+  if (saveTimer) { clearTimeout(saveTimer); try { persistLocal(); } catch (_) {} }
 });
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 // ---------------------------------------------------------------- helpers
 
@@ -202,6 +293,122 @@ function readBody(req) {
 
 const str = (v, fallback = '') => (typeof v === 'string' ? v : fallback);
 const arr = (v) => (Array.isArray(v) ? v : []);
+
+// ---------------------------------------------------------------- auth helpers
+
+const b64url = (s) => Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64urlDecode = (s) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+const sign = (data) => crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64')
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+function makeSession(sub) {
+  const payload = b64url(JSON.stringify({ sub, exp: Date.now() + SESSION_TTL_MS }));
+  return payload + '.' + sign(payload);
+}
+function verifySession(token) {
+  if (!token || token.indexOf('.') < 0) return null;
+  const [payload, sig] = token.split('.');
+  const expected = sign(payload);
+  if (!sig || sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    const data = JSON.parse(b64urlDecode(payload));
+    if (!data.exp || data.exp < Date.now()) return null;
+    return data;
+  } catch (_) { return null; }
+}
+function parseCookies(req) {
+  const out = {};
+  const h = req.headers.cookie;
+  if (!h) return out;
+  for (const part of h.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+const isSecureReq = (req) => (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+function cookieHeader(name, value, maxAgeSec, req) {
+  const bits = [`${name}=${value}`, 'HttpOnly', 'Path=/', `Max-Age=${maxAgeSec}`, 'SameSite=Lax'];
+  if (isSecureReq(req)) bits.push('Secure');
+  return bits.join('; ');
+}
+const setSessionCookie = (req, res, token) =>
+  res.setHeader('Set-Cookie', cookieHeader(COOKIE, token, Math.floor(SESSION_TTL_MS / 1000), req));
+const clearSessionCookie = (req, res) =>
+  res.setHeader('Set-Cookie', cookieHeader(COOKIE, '', 0, req));
+const isAuthed = (req) => !authEnabled || !!verifySession(parseCookies(req)[COOKIE]);
+const hasCaptureToken = (req) => !!CAPTURE_TOKEN && req.headers['x-helm-token'] === CAPTURE_TOKEN;
+
+// ---- login rate limiting (per IP)
+const MAX_ATTEMPTS = 5;
+const LOCK_MS = 15 * 60 * 1000;
+const attempts = new Map(); // ip -> { count, first }
+function clientIP(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return xff.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+function rateState(ip) {
+  const rec = attempts.get(ip);
+  if (rec && Date.now() - rec.first > LOCK_MS) { attempts.delete(ip); return null; }
+  return rec || null;
+}
+
+// ---- Google OAuth (zero-dep, via fetch)
+function googleRedirectUri(req) {
+  if (GOOGLE_REDIRECT_URI) return GOOGLE_REDIRECT_URI;
+  const proto = isSecureReq(req) ? 'https' : 'http';
+  return `${proto}://${req.headers.host || `localhost:${PORT}`}/api/auth/google`;
+}
+function handleGoogleStart(req, res) {
+  if (!hasGoogle) { res.writeHead(404); return res.end('Google sign-in not configured'); }
+  const state = crypto.randomBytes(16).toString('hex');
+  res.setHeader('Set-Cookie', cookieHeader('helm_oauth_state', state, 600, req));
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: googleRedirectUri(req),
+    response_type: 'code',
+    scope: 'openid email',
+    state,
+    prompt: 'select_account',
+  });
+  res.writeHead(302, { Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}` });
+  res.end();
+}
+async function handleGoogleCallback(req, res, url) {
+  const fail = (e) => { res.writeHead(302, { Location: '/?error=' + e }); res.end(); };
+  if (!hasGoogle) return fail('auth_failed');
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+  const cookieState = parseCookies(req).helm_oauth_state;
+  if (!code || !state || !cookieState || state !== cookieState) return fail('auth_failed');
+  try {
+    const tok = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: googleRedirectUri(req),
+        grant_type: 'authorization_code',
+      }),
+    });
+    const data = await tok.json();
+    if (!tok.ok || !data.id_token) return fail('auth_failed');
+    const claims = JSON.parse(b64urlDecode(data.id_token.split('.')[1]));
+    const email = str(claims.email).toLowerCase();
+    if (!email || claims.email_verified === false) return fail('auth_failed');
+    if (ALLOWED_EMAILS.length && !ALLOWED_EMAILS.includes(email)) return fail('not_allowed');
+    setSessionCookie(req, res, makeSession('google:' + email));
+    res.writeHead(302, { Location: '/' });
+    res.end();
+  } catch (e) {
+    return fail('auth_failed');
+  }
+}
 
 // ---------------------------------------------------------------- entities
 
@@ -277,6 +484,26 @@ function sanitizeTask(input, existing) {
   return t;
 }
 
+function localDateStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// My Day daily rollover: on a new day, unfinished items carry over (stay on My
+// Day) while items completed on a previous day drop off, so the list stays
+// trustworthy instead of accreting yesterday's checked-off tasks. Returns true
+// if anything changed. (Uses server-local date; fine for a single user.)
+function maybeRolloverMyDay() {
+  const today = localDateStr();
+  if (db.settings.lastRollover === today) return false;
+  for (const t of db.tasks) {
+    if (t.today && t.status === 'done') t.today = false;
+  }
+  db.settings.lastRollover = today;
+  return true;
+}
+
 function nextDue(due, repeat) {
   const d = due ? new Date(due + 'T12:00:00') : new Date();
   switch (repeat) {
@@ -290,15 +517,121 @@ function nextDue(due, repeat) {
   return d.toISOString().slice(0, 10);
 }
 
+// ---------------------------------------------------------------- push notifications
+/* Server-side reminder firing via the Expo Push API, so a task's ⏰ reminder
+ * pings the phone even when the app is closed. Reminders are stored as local
+ * wall-clock ("YYYY-MM-DDTHH:MM") with no offset, so we evaluate "now" in the
+ * client-reported timezone (settings.tz). On-device local notifications in the
+ * mobile app are the no-server fallback; this is the always-on path. */
+
+function localNowInTz(tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz || undefined,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(new Date());
+    const g = (t) => parts.find((p) => p.type === t).value;
+    let hh = g('hour'); if (hh === '24') hh = '00';
+    return `${g('year')}-${g('month')}-${g('day')}T${hh}:${g('minute')}`;
+  } catch (_) {
+    return new Date().toISOString().slice(0, 16); // UTC fallback
+  }
+}
+
+async function sendExpoPush(tokens, title, body, data) {
+  const msgs = tokens
+    .filter((t) => /^ExponentPushToken\[|^ExpoPushToken\[/.test(t))
+    .map((to) => ({ to, title, body, sound: 'default', data: data || {} }));
+  for (let i = 0; i < msgs.length; i += 100) {
+    try {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(msgs.slice(i, i + 100)),
+      });
+    } catch (err) { console.error('Expo push send failed:', err.message); }
+  }
+}
+
+let reminderTimer = null;
+async function fireDueReminders() {
+  if (!db.pushTokens || !db.pushTokens.length) return;
+  const nowLocal = localNowInTz(db.settings.tz);
+  const due = db.tasks.filter((t) => t.status !== 'done' && t.remind && !t.remindedAt && t.remind <= nowLocal);
+  if (!due.length) return;
+  const tokens = db.pushTokens.map((p) => p.token);
+  for (const t of due) {
+    await sendExpoPush(tokens, '⏰ ' + t.title, t.due ? 'Due ' + t.due : 'Reminder', { taskId: t.id });
+    t.remindedAt = now();
+  }
+  saveData();
+}
+
 // ---------------------------------------------------------------- API router
 
-async function handleAPI(req, res, pathname) {
+async function handleAPI(req, res, pathname, url) {
   const seg = pathname.split('/').filter(Boolean); // ['api', 'tasks', ':id', ...]
   const method = req.method;
+
+  // ---- public auth endpoints (no session required)
+  if (pathname === '/api/auth-info' && method === 'GET') {
+    return sendJSON(res, 200, { hasPassword, hasGoogle });
+  }
+  if (pathname === '/api/login' && method === 'POST') {
+    if (!hasPassword) return sendJSON(res, 400, { error: 'Password login is not enabled' });
+    const ip = clientIP(req);
+    const rec = rateState(ip);
+    if (rec && rec.count >= MAX_ATTEMPTS) {
+      const mins = Math.ceil((LOCK_MS - (Date.now() - rec.first)) / 60000);
+      return sendJSON(res, 429, { error: `Too many attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.` });
+    }
+    const body = await readBody(req);
+    const a = Buffer.from(str(body.password));
+    const b = Buffer.from(HELM_PASSWORD);
+    const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!ok) {
+      const next = { count: (rec ? rec.count : 0) + 1, first: rec ? rec.first : Date.now() };
+      attempts.set(ip, next);
+      const remaining = Math.max(0, MAX_ATTEMPTS - next.count);
+      return sendJSON(res, 403, {
+        error: remaining > 0
+          ? `Incorrect password — ${remaining} attempt${remaining > 1 ? 's' : ''} remaining`
+          : 'Too many attempts. Try again later.',
+      });
+    }
+    attempts.delete(ip);
+    setSessionCookie(req, res, makeSession('pw'));
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (pathname === '/api/logout' && method === 'POST') {
+    clearSessionCookie(req, res);
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (pathname === '/api/auth/google' && method === 'GET') {
+    return handleGoogleCallback(req, res, url);
+  }
+
+  // ---- quick-capture via standalone token (iOS Shortcuts etc.): create-only
+  if (pathname === '/api/capture' && method === 'POST' && (isAuthed(req) || hasCaptureToken(req))) {
+    const body = await readBody(req);
+    const parsed = parseCapture(str(body.text), db.projects);
+    if (!parsed.title) return sendJSON(res, 400, { error: 'Nothing to capture' });
+    delete parsed._projName;
+    const t = sanitizeTask(parsed);
+    db.tasks.push(t);
+    logActivity('task-created', `Added task "${t.title}"`, t.id);
+    saveData();
+    return sendJSON(res, 201, t);
+  }
+
+  // ---- everything past here requires a valid session
+  if (!isAuthed(req)) return sendJSON(res, 401, { error: 'Authentication required' });
 
   // GET /api/state — everything the client needs
   if (pathname === '/api/state' && method === 'GET') {
     await maybeRefreshFromNeon();
+    if (maybeRolloverMyDay()) saveData();
     const { openrouterKey, ...safeSettings } = db.settings;
     return sendJSON(res, 200, {
       projects: db.projects,
@@ -426,9 +759,30 @@ async function handleAPI(req, res, pathname) {
     if (body.theme !== undefined) s.theme = body.theme === 'light' ? 'light' : 'dark';
     if (body.openrouterModel !== undefined) s.openrouterModel = str(body.openrouterModel).slice(0, 100);
     if (body.openrouterKey !== undefined) s.openrouterKey = str(body.openrouterKey).slice(0, 300);
+    if (body.tz !== undefined) s.tz = str(body.tz).slice(0, 64);
     saveData();
     const { openrouterKey, ...safe } = s;
     return sendJSON(res, 200, { ...safe, hasKey: !!openrouterKey });
+  }
+
+  // ---- push tokens (Expo) for server-fired reminders
+  if (seg[1] === 'push' && method === 'POST') {
+    const body = await readBody(req);
+    const token = str(body.token).slice(0, 200);
+    if (!token) return sendJSON(res, 400, { error: 'Missing push token' });
+    db.pushTokens = db.pushTokens || [];
+    if (seg[2] === 'register') {
+      if (!db.pushTokens.some((p) => p.token === token)) {
+        db.pushTokens.push({ token, platform: str(body.platform).slice(0, 20), addedAt: now() });
+        saveData();
+      }
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (seg[2] === 'unregister') {
+      db.pushTokens = db.pushTokens.filter((p) => p.token !== token);
+      saveData();
+      return sendJSON(res, 200, { ok: true });
+    }
   }
 
   // ---- full backup / restore
@@ -523,14 +877,15 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
   try {
-    if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname);
+    if (pathname === '/auth/google') return handleGoogleStart(req, res);
+    if (pathname.startsWith('/api/')) return await handleAPI(req, res, pathname, url);
     return serveStatic(req, res, pathname);
   } catch (err) {
     return sendJSON(res, 500, { error: err.message || 'Server error' });
   }
 });
 
-(async function start() {
+async function start() {
   loadDataLocal();
   if (useNeon) {
     try {
@@ -540,6 +895,11 @@ const server = http.createServer(async (req, res) => {
       console.error('  ☁ Cloud sync FAILED, falling back to local file:', err.message);
     }
   }
+  // Fire due reminders as Expo push notifications every minute (no-op until a
+  // device registers a push token).
+  reminderTimer = setInterval(() => { fireDueReminders().catch(() => {}); }, 60000);
+  setTimeout(() => { fireDueReminders().catch(() => {}); }, 5000);
+
   server.listen(PORT, HOST, () => {
     const nets = os.networkInterfaces();
     const lan = [];
@@ -550,9 +910,25 @@ const server = http.createServer(async (req, res) => {
     }
     console.log('');
     console.log('  ⎈ Helm is running');
+    if (authEnabled) {
+      const modes = [hasPassword && 'password', hasGoogle && 'Google'].filter(Boolean).join(' + ');
+      console.log(`    Auth:     ON (${modes})`);
+    } else {
+      console.log('    Auth:     OFF — set HELM_PASSWORD (and/or GOOGLE_CLIENT_ID/SECRET) before exposing this server');
+    }
     console.log(`    Local:    http://localhost:${PORT}`);
     lan.forEach((ip) => console.log(`    Network:  http://${ip}:${PORT}   ← open this on your iPhone (same Wi-Fi)`));
     console.log(`    Data:     ${DATA_FILE}${useNeon ? '  (+ Neon cloud sync)' : ''}`);
     console.log('');
   });
-})();
+}
+
+if (require.main === module) start();
+
+// Exposed for unit tests (node --test). Not part of the HTTP surface.
+module.exports = {
+  sanitizeTask, sanitizeProject, nextDue, maybeRolloverMyDay, localDateStr,
+  makeSession, verifySession, mergeById, mergeRemote,
+  _setDb: (d) => { db = d; },
+  _getDb: () => db,
+};
