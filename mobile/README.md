@@ -12,6 +12,8 @@ built for **Expo SDK 54** (matches Expo Go 54.x from the App Store).
   Done filters. Tap to complete, long-press for status / My Day / promote / delete.
 - **Projects** — color-coded cards with progress, drill-down to a project's tasks
   grouped by status, plus inline quick-add.
+- **Agenda** — day-by-day view of what's due / reminded, with an overdue section
+  and Week / 2-week / Month ranges.
 - **Board** — kanban columns (To do / In progress / Waiting on / Done); tap a card
   to move it.
 

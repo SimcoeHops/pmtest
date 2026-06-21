@@ -329,7 +329,7 @@ function bindTaskRows(container) {
 function taskModal(taskId, defaults = {}) {
   const t = taskId ? S.tasks.find((x) => x.id === taskId) : null;
   const d = t || {
-    title: '', notes: '', status: 'todo', priority: 'medium', due: null, remind: null,
+    title: '', notes: '', status: 'todo', priority: 'medium', due: defaults.due || null, remind: null,
     projectIds: defaults.projectIds || [], tags: [], subtasks: [], repeat: 'none', today: !!defaults.today,
   };
   let subtasks = d.subtasks.map((s) => ({ ...s }));
@@ -948,6 +948,71 @@ function viewTasks() {
   $('#tk-prio').onchange = (e) => { taskFilters.priority = e.target.value; render(); };
 }
 
+// ---- calendar / agenda
+
+let calRange = 7; // days shown in the agenda
+
+function viewCalendar() {
+  const open = S.tasks.filter((t) => t.status !== 'done');
+  const overdue = open.filter((t) => t.due && daysUntil(t.due) < 0).sort(taskSort);
+
+  // Items land on a day if they're due that day OR have a reminder that day.
+  const onDay = (t, d) => t.due === d || (t.remind && t.remind.slice(0, 10) === d);
+
+  const days = [];
+  for (let i = 0; i < calRange; i++) {
+    const d = addDays(todayStr(), i);
+    const items = open.filter((t) => onDay(t, d)).sort(taskSort);
+    days.push([d, items]);
+  }
+  const scheduled = new Set(days.flatMap(([, items]) => items.map((t) => t.id)));
+  const totalScheduled = scheduled.size;
+
+  const dayBlock = ([d, items]) => {
+    const n = daysUntil(d);
+    const dt = new Date(d + 'T12:00:00');
+    const rel = n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : dt.toLocaleDateString(undefined, { weekday: 'long' });
+    const sub = dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const isWeekend = dt.getDay() === 0 || dt.getDay() === 6;
+    return `
+      <div class="cal-day ${n === 0 ? 'is-today' : ''} ${isWeekend ? 'is-weekend' : ''}">
+        <div class="cal-dayhead">
+          <div class="cal-daylabel"><span class="cal-rel">${rel}</span><span class="cal-date">${sub}</span></div>
+          <button class="t-act cal-add" data-add-due="${d}" title="Add a task on ${sub}">＋</button>
+        </div>
+        ${items.length
+          ? `<div class="task-list">${items.map((t) => taskRowHTML(t)).join('')}</div>`
+          : `<div class="cal-empty">—</div>`}
+      </div>`;
+  };
+
+  setView(`
+    <div class="page-head">
+      <div><h1>🗓 Calendar</h1><p class="page-sub">${totalScheduled} scheduled · ${overdue.length} overdue</p></div>
+      <div class="spacer"></div>
+      <div class="seg" id="cal-range">
+        ${[[7, 'Week'], [14, '2 weeks'], [30, 'Month']].map(([v, l]) => `<button data-v="${v}" class="${calRange === v ? 'on' : ''}">${l}</button>`).join('')}
+      </div>
+      <button class="btn btn-primary" id="cal-new">＋ New task</button>
+    </div>
+
+    ${overdue.length ? `
+      <div class="cal-day is-overdue">
+        <div class="cal-dayhead"><div class="cal-daylabel"><span class="cal-rel" style="color:var(--red)">⚠ Overdue</span><span class="cal-date">${overdue.length}</span></div></div>
+        <div class="task-list">${overdue.map((t) => taskRowHTML(t)).join('')}</div>
+      </div>` : ''}
+
+    <div class="cal-grid">${days.map(dayBlock).join('')}</div>
+  `);
+
+  bindTaskRows($('#view'));
+  $('#cal-new').onclick = () => taskModal(null);
+  $$('#cal-range button').forEach((b) => { b.onclick = () => { calRange = Number(b.dataset.v); render(); }; });
+  $$('[data-add-due]', $('#view')).forEach((b) => {
+    b.onclick = (e) => { e.stopPropagation(); taskModal(null, { due: b.dataset.addDue }); };
+  });
+}
+
 // ---- board (kanban)
 
 function viewBoard() {
@@ -1274,6 +1339,7 @@ function render() {
     case 'projects': viewProjects(); break;
     case 'project': viewProject(route.param); break;
     case 'tasks': viewTasks(); break;
+    case 'calendar': viewCalendar(); break;
     case 'board': viewBoard(); break;
     case 'report': viewReport(); break;
     case 'settings': viewSettings(); break;
@@ -1355,6 +1421,7 @@ function paletteItems() {
     { type: 'cmd', icon: '☀', label: 'Go to My Day', keys: '2', run: go('#/today') },
     { type: 'cmd', icon: '▣', label: 'Go to Projects', keys: '3', run: go('#/projects') },
     { type: 'cmd', icon: '☑', label: 'Go to Tasks', keys: '4', run: go('#/tasks') },
+    { type: 'cmd', icon: '🗓', label: 'Go to Calendar', keys: 'C', run: go('#/calendar') },
     { type: 'cmd', icon: '⫿', label: 'Go to Board', keys: '5', run: go('#/board') },
     { type: 'cmd', icon: '⎙', label: 'Go to Report', keys: '6', run: go('#/report') },
     { type: 'cmd', icon: '⚙', label: 'Go to Settings', run: go('#/settings') },
@@ -1471,6 +1538,7 @@ document.addEventListener('keydown', (e) => {
   else if (k === '4') location.hash = '#/tasks';
   else if (k === '5') location.hash = '#/board';
   else if (k === '6') location.hash = '#/report';
+  else if (k === 'c') location.hash = '#/calendar';
 });
 
 // ------------------------------------------------------------ alerts & reminders

@@ -38,6 +38,10 @@ export default function TabsLayout() {
         options={{ title: 'Tasks', tabBarIcon: tabIcon('checkmark-circle') }}
       />
       <Tabs.Screen
+        name="agenda"
+        options={{ title: 'Agenda', tabBarIcon: tabIcon('calendar') }}
+      />
+      <Tabs.Screen
         name="projects"
         options={{ title: 'Projects', tabBarIcon: tabIcon('albums') }}
       />

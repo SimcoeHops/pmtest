@@ -106,6 +106,9 @@ Windows machine, and continue where you left off.
   filter and group the full task list by project, due date, tag, priority.
 - **Board** — kanban (To do / In progress / Waiting on / Done) with drag &
   drop, per-project or global.
+- **Calendar / agenda** (`C`) — a day-by-day view of what's due and what has
+  reminders, with an overdue rail up top; Week / 2-week / Month ranges, and a
+  per-day ＋ to drop a task on a specific date.
 - **Reminders & alerts** — per-task ⏰ reminders, a 🔔 bell with overdue /
   due-today / upcoming / stale buckets, optional desktop notifications and a
   morning digest. Recurring tasks (daily / weekdays / weekly / biweekly /
@@ -129,6 +132,7 @@ Windows machine, and continue where you left off.
 | `⌘/Ctrl + K` | Command palette (search + jump + act anywhere) |
 | `N` or `Q` | Quick capture |
 | `P` | New project |
+| `C` | Calendar / agenda |
 | `/` | Search |
 | `1–6` | Dashboard · My Day · Projects · Tasks · Board · Report |
 | `Esc` | Close modal / clear search |

@@ -10,6 +10,13 @@ function pad(n: number): string {
   return String(n).padStart(2, '0');
 }
 
+// today + n days, as a local YYYY-MM-DD string.
+export function addDaysISO(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 export function isOverdue(due: string | null, done: boolean): boolean {
   if (!due || done) return false;
   return due < todayISO();

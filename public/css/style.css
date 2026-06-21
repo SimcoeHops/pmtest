@@ -981,3 +981,28 @@ kbd {
   border: 1px solid var(--border); border-radius: 5px; padding: 0 5px; margin-right: 3px;
   font-size: 11px; background: var(--card-2);
 }
+
+/* ============================================================ calendar / agenda */
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.cal-day {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 13px;
+}
+.cal-day.is-today { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
+.cal-day.is-weekend { background: var(--bg-soft); }
+.cal-day.is-overdue { border-color: var(--red); margin-bottom: 14px; }
+.cal-dayhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.cal-daylabel { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.cal-rel { font-weight: 700; font-size: 14.5px; color: var(--text); }
+.cal-date { font-size: 12.5px; color: var(--text-faint); }
+.cal-day.is-today .cal-rel { color: var(--accent); }
+.cal-add { width: 28px; height: 28px; font-size: 16px; opacity: 0.6; }
+.cal-add:hover { opacity: 1; }
+.cal-empty { color: var(--text-faint); font-size: 13px; padding: 2px 2px 4px; }
+.cal-day .task-list { gap: 7px; }
